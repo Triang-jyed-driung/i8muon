@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "i8muon"
+version = "0.1.0"
+description = "Int8-accelerated Muon optimizer with TileLang CUDA kernels"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.8",
+    "torchvision",
+    "tilelang>=0.1.10",
+]
+
+[project.optional-dependencies]
+test = [
+    "numpy",
+    "datasets",
+    "matplotlib",
+]
+
+[project.urls]
+Homepage = "https://github.com/user/i8muon"
+
+[tool.setuptools.packages.find]
+where = ["src"]
