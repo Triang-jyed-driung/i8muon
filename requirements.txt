@@ -1,3 +1,2 @@
 torch>=2.8
-torchvision
 tilelang>=0.1.10

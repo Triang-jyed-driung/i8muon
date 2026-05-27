@@ -11,13 +11,13 @@ license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.8",
-    "torchvision",
     "tilelang>=0.1.10",
 ]
 
 [project.optional-dependencies]
 test = [
     "numpy",
+    "torchvision",
     "datasets",
     "matplotlib",
 ]
