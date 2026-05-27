@@ -1,8 +1,0 @@
-torch>=2.8
-torchvision
-numpy
-tilelang>=0.1.10
-
-[test]
-datasets
-matplotlib
