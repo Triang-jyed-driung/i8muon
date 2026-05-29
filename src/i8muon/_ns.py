@@ -363,6 +363,7 @@ class NSInt8:
         transposed = ROW > COL
         if transposed:
             A = A.mT.contiguous()
+        QQA = torch.as_strided(A, (L, L), (L, 1))
 
         # ── Step 3: R = A @ A^T (Gram matrix in Type2) ──
         self._aat_prec(M=L, K=H, dtype=precision)(A, R)
@@ -384,7 +385,9 @@ class NSInt8:
                 self._ab_prec(M=L, N=H, K=L, dtype=precision)(Q, A, Y)
                 # R = Y @ Y^T  (recompute Gram)
                 self._aat_prec(M=L, K=H, dtype=precision)(Y, R)
-                A.copy_(Y)
+                
+                A, Y = Y, A 
+                QQ, QQA = QQA, QQ
 
             if kind in ("i", "r"):
                 # Q = Quad(R)
@@ -550,6 +553,7 @@ class NSInt8:
         B = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
         C = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
         AA = torch.as_strided(C, (L, L), (L, 1))
+        AAA = torch.as_strided(A, (L, L), (L, 1))
 
         A_frob_norm = torch.linalg.vector_norm(X).view(1)
         self._to_prec(
@@ -572,5 +576,6 @@ class NSInt8:
                     C = C.mT.contiguous()
                 return C.to(X.dtype)
             else:
-                A.copy_(C)
+                A, C = C, A
+                AA, AAA = AAA, AA
         raise RuntimeError("unreachable")
