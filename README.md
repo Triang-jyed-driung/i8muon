@@ -124,7 +124,7 @@ Fifteen custom CUDA kernels written in the TileLang DSL. They fall into several 
 - `_int32_compl_symm_int8`: Completes a symmetric int8 matrix from its int32 lower triangle. Fills the upper triangle by transposition, extracts the diagonal as float32, and zeroes the diagonal in the int8 off-diagonal matrix.
 - `_typeii_int8_sq`: Computes the polynomial `Z = a*I + b*A + c*A^2` directly from the symmetric int8 (Type2) representation, avoiding materialization to float.
 - `_float32_compl_symm_int8_quad`: Completes a symmetric int8 matrix from a float32 lower triangle. Unlike `_int32_compl_symm_int8`, it simultaneously applies the quadratic polynomial (a,b,c) to the diagonal.
-- `_typeii_int8_ab`: Computes `A @ B` for two symmetric int8 matrices.
+- `_typeii_int8_ab`: Computes `A @ B` for two **symmetric commutative** int8 matrices.
 - `_float32_ab_to_int8`: Converts a float32 symmetric matrix to int8 symmetric representation.
 - `_typeii_typei_int8`: Computes `A @ B` where A is symmetric int8 and B is general int8.
 - `_float32_to_int8`: Converts a general float32 matrix to int8.
