@@ -12,13 +12,13 @@ A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8
 
 ### Muon Optimizer
 
-Muon is a stochastic optimizer designed for the hidden-layer weight matrices of neural networks. Its core idea: after accumulating gradient momentum, apply **Newton-Schulz orthogonalization** to the update direction, then step. The orthogonalization enforces an approximate spectral norm of 1 on the update, which stabilizes training for large models without needing per-tensor learning-rate scaling.
+Muon is a optimizer designed for the hidden-layer weight matrices of neural networks. Its core idea: after accumulating gradient momentum, apply **Newton-Schulz orthogonalization** to the update direction, then step. The orthogonalization enforces an approximate spectral norm of 1 on the update, which stabilizes training for large models.
 
 A single Muon step (simplified) is:
 
 ```
 g_t      = gradient
-B_t      = mu * B_{t-1} + g_t                     (momentum)
+B_t      = mu * B_{t-1} + g_t                      (momentum)
 O_t      = NewtonSchulz(B_t)                       (orthogonalize)
 theta_t  = theta_{t-1} - adjusted_lr * O_t         (apply, with optional weight decay)
 ```
@@ -35,16 +35,16 @@ X = Z @ X
 
 After several iterations with specific coefficients (a, b, c), X converges to a matrix with orthonormal rows, satisfying `X @ X^T ≈ I`.
 
-The Gram Newton-Schulz variant adds periodic "restart" steps where the Gram matrix is recomputed from the updated X, then the polynomial is applied to the new Gram. This reduces the number of iterations needed but is more sensitive to numerical error.
+The Gram Newton-Schulz variant adds periodic "restart" steps where the Gram matrix is recomputed from the updated X, then the polynomial is applied to the new Gram. This reduces numerical error at the cost of recomputation.
 
 ### Int8 Acceleration
 
-Both formulations are dominated by matrix multiplications (X @ X^T, Z @ X, etc.). This project quantizes the matrices to int8, uses **NVIDIA Tensor Cores** (`mma` instructions) for the GEMM operations, and manages scale factors to reconstruct float32 results. The core kernels are authored in TileLang and JIT-compiled to CUDA.
+Both formulations are dominated by matrix multiplications (X @ X^T, Z @ X, etc.). This project quantizes the matrices to int8, uses **NVIDIA Tensor Cores** (`mma` instructions) for the GEMM operations, and manages scale factors to reconstruct float32 results. The core kernels are written in TileLang and JIT-compiled to CUDA.
 
 ## Architecture
 
 ```
-                        Muon Optimizer (i8muon.py)
+                  Muon Optimizer (i8muon.py)
                               |
                      _single_tensor_muon()
                               |
@@ -56,9 +56,9 @@ Both formulations are dominated by matrix multiplications (X @ X^T, Z @ X, etc.)
       _regular_i8()      selects path        _regular_prec()
       (int8 NS)          based on shape      (fp16 NS)
                               |
-                    NSInt8 Engine (i8muon_NS.py)
+                    NSInt8 Engine (_NS.py)
                               |
-              TileLang JIT Kernels (i8muon_kernels.py)
+              TileLang JIT Kernels (_kernels.py)
                          15 CUDA kernels
 ```
 
@@ -96,7 +96,9 @@ PyTorch `Optimizer` subclass. Key parameters:
 
 **Interaction between `autotune` and `deterministic`.** When both are enabled (`autotune=True`, `deterministic=True`), the result is *relatively* deterministic: after tuning completes, the selected optimal kernel configurations remain fixed across runs, so subsequent steps produce bit-identical results for the same input. To guarantee *absolute* determinism independent of tuning, set `autotune=False`.
 
-Only **2D parameters** are supported (typical for linear layer weight matrices).
+**Warning**: set `deterministic=False` in multi-GPU DDP training results in divergent behavior.
+
+Only **2D parameters** are supported (typical for linear layer weight matrices). If necessary, you may create a different view on tensors with different numbers of dimensions.
 
 ### 2. `NSInt8` Engine (`i8muon_NS.py`)
 
@@ -136,7 +138,7 @@ Fifteen custom CUDA kernels written in the TileLang DSL. They fall into several 
 - `_quad_prec`: Quadratic polynomial `Z = a*I + b*A + c*A^2` in fp16/bf16.
 - `_ab_symm_prec`: Symmetric matrix multiplication `A @ B` in fp16/bf16.
 
-All kernels take `M`, `N`, `K` as runtime arguments and are compiled on first use by TileLang's JIT.
+All kernels take some of `M`, `N`, `K` as runtime arguments and are compiled on first use by TileLang's JIT.
 
 ### 4. Triangular Block Layout
 
@@ -205,13 +207,13 @@ The `_gram_*` methods additionally scale all coefficients by 0.997 per iteration
 ## Installation
 
 Requirements:
-- Python >= 3.10
+- Python >= 3.10 (tested and verified on 3.12, 3.13 and 3.14)
 - PyTorch >= 2.8 with CUDA
 - TileLang >= 0.1.10
 - NVIDIA GPU with Compute Capability >= 7.5 (Turing or newer, for int8 Tensor Cores)
 
 ```
-pip install torch torchvision
+pip install torch
 pip install tilelang
 ```
 
@@ -255,7 +257,7 @@ for epoch in range(num_epochs):
 ```python
 optimizer = Muon(
     model.parameters(),
-    lr=0.001,
+    lr=0.01,
     precision="float16",   # or "bfloat16" or "float32"
 )
 ```
@@ -304,8 +306,6 @@ Tests cover:
 - **Optimizer steps**: Full step correctness, graph vs no-graph equivalence, multi-parameter graphs
 - **Condition number scan**: Degradation across condition numbers from exp(0.2) to exp(2.0)
 
-All correctness tests require CUDA.
-
 ## Known Limitations
 
 1. **2D parameters only.** Muon is designed for linear layer weight matrices. 1D parameters (biases, LayerNorm weights) and parameters with dimension > 2 are not supported.
@@ -314,7 +314,7 @@ All correctness tests require CUDA.
 
 3. **Autotune overhead.** When `autotune=True`, the first step triggers TileLang's autotuner to benchmark candidate tile configurations for each kernel family. The total duration is approximately 10 minutes, depending on CPU speed and the number of distinct matrix shapes in the model. For LLM training where only 4 to 6 distinct weight-matrix shapes exist, enabling autotune is recommended because the one-time cost is amortized over millions of steps. For models with many different shapes (e.g., heterogeneous architectures with dozens of unique layer dimensions), the overhead may not be worth it. Set `autotune=False` to skip tuning and use default tile sizes instead.
 
-4. **No distributed support in this codebase.** The optimizer itself is compatible with standard PyTorch distributed training (each rank runs its own Muon step independently), but the CIFAR-10 demo and test suite are single-GPU.
+4. **No tensor-parallel distributed support yet.** The optimizer itself is compatible with standard PyTorch DDP (each rank runs its own Muon step independently), but the CIFAR-10 demo and test suite are single-GPU.
 
 ## References
 
