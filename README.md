@@ -131,6 +131,8 @@ Fifteen custom CUDA kernels written in the TileLang DSL. They fall into several 
 - `_typeii_typei_int8`: Computes `A @ B` where A is symmetric int8 and B is general int8.
 - `_float32_to_int8`: Converts a general float32 matrix to int8.
 
+<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/1f6d1300-a00f-4980-a32d-6be405cd298e" />
+
 **Floating point precision kernels:**
 - `_to_prec`: Normalizes and casts to fp16/bf16.
 - `_ab_prec`: General matrix multiplication in fp16/bf16.
@@ -158,6 +160,10 @@ pid_n = (base_pid - pid_m*(pid_m+1)/2) * R + (pid % R)
 This reduces kernel launch count by approximately 50% for symmetric operations. Combined with int8 quantization (4x memory reduction vs float32), this layout significantly improves GPU occupancy and reduces memory bandwidth pressure.
 
 When two kernels operate on the same symmetric int8 matrix (e.g., one computing the triangular GEMM and the next completing or reducing it), both kernels must agree on the block tiling. The second completion kernel must satisfy `BLOCK_M >= BLOCK_N`, and both block dimensions must be factors of `lcm(BLOCK_M, BLOCK_N)` of the first kernel. The autotuner respects these constraints automatically through the config filter conditions defined in `_make_configs`.
+
+
+<img width="868" height="797" alt="image" src="https://github.com/user-attachments/assets/c5bbe118-9993-47e6-9719-160afa17d68f" />
+
 
 ### 5. CUDA Graph Support
 
