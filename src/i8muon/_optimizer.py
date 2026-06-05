@@ -110,7 +110,7 @@ class Muon(Optimizer):
         eps: float = EPS,
         adjust_lr_fn="spectral",
         *,
-        precision: str = 'auto', # 'auto' | 'int8' | 'float16' | 'bfloat16' | 'fp16' | 'bf16'
+        precision: str = 'auto', # 'auto' | 'int8' | 'float16' | 'bfloat16' | 'fp16' | 'bf16' | 'fp8' | 'int8_block'
         autotune: bool = False,
         use_gram: bool = True,
         use_cuda_graph: bool = False,
@@ -143,16 +143,19 @@ class Muon(Optimizer):
         ):
             raise ValueError(f"adjust_lr_fn {adjust_lr_fn} is not supported")
 
+
         supported_precisions = {
             'auto': 'auto', 'default': 'auto', 
             'int8': 'int8', 'i8': 'int8',
             'float16': 'float16', 'half': 'float16', 'f16': 'float16', 'fp16': 'float16',
             'bfloat16': 'bfloat16', 'bf16': 'bfloat16', 
             'float32': 'float32', 'float': 'float32', 'fp32': 'float32',
+            'fp8': 'float8_e4m3fn', 'float8': 'float8_e4m3fn', 'float8_e4m3': 'float8_e4m3fn', 'float8_e4m3fn': 'float8_e4m3fn',
+            'int8_bq': 'int8_bq', 'int8_block': 'int8_bq', 'i8bq': 'int8_bq', 'i8block': 'int8_bq',
             # 'float64': 'float64', 'double': 'float64', 'fp64': 'float64',
         }
         if precision.lower() not in supported_precisions:
-            raise ValueError(f"Supported precisions are {supported_precisions.keys()}, but got: {precision}")
+            raise ValueError(f"Supported precisions are {list(set(supported_precisions.values()))}, but got: {precision}")
 
         precision = supported_precisions[precision.lower()]
 
@@ -162,7 +165,7 @@ class Muon(Optimizer):
                 ns_coefficients = _DEFAULT_NS_COEFFS
             else:
                 ns_coefficients = recommend_coefficients(
-                    precision=(precision not in ("int8", "auto")), iters=ns_steps
+                    precision=(precision not in ("int8", "auto", 'float8_e4m3fn', 'int8_bq')), iters=ns_steps
                 )
 
         self._ns = NSInt8(autotune=autotune)
@@ -330,8 +333,18 @@ def _single_tensor_muon(
         )
         if gram_method and actual_prec == 'int8': 
             actual_prec = 'float16'
+
+        use_bq = False
+        if precision == "float8_e4m3fn":
+            actual_prec = "float8_e4m3fn"
+            use_bq = True
+        if precision == "int8_bq":
+            actual_prec = "int8"
+            use_bq = True
         
         ns_fn = (
+            (ns_engine._gram_bq if gram_method else ns_engine._regular_bq)
+            if use_bq else
             ns_engine._gram_prec 
             if gram_method else 
             ns_engine._regular_i8

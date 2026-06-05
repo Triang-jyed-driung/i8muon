@@ -8,7 +8,14 @@ import torch
 from ._kernels import *
 from functools import cache, lru_cache
 
+
+
+_CONF = {tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True}
+
+
 # pyright: reportAttributeAccessIssue=false
+
+def _cdiv(a, b): return -(-a // b)
 
 _DEFAULT_NS_COEFFS = [
     (3.9274, -8.7643,  5.3095),
@@ -43,14 +50,14 @@ def _make_configs(condition=lambda x: 1, **kwargs):
 
 _MN_mem_configs = _make_configs(
     BLOCK_M=[8, 16, 32, 64],
-    BLOCK_N=[8, 16, 32, 64],
+    BLOCK_N=[16, 64],
     threads=[64, 128, 256, 512],
     condition=lambda x: (x["BLOCK_M"] * x["BLOCK_N"] >= x["threads"])
 )
 
 _MN_mem_configs_packed = _make_configs(
-    BLOCK_M=[8, 16, 32, 64],
-    BLOCK_N=[8, 16, 32, 64],
+    BLOCK_M=[16, 32, 64],
+    BLOCK_N=[16, 64],
     threads=[64, 128, 256, 512],
     condition=lambda x: (x["BLOCK_M"] * x["BLOCK_N"] >= x["threads"] and x["BLOCK_M"] >= x["BLOCK_N"])
 )
@@ -58,7 +65,7 @@ _MN_mem_configs_packed = _make_configs(
 _MNK_configs = _make_configs(
     BLOCK_M=[128, 256],
     BLOCK_N=[64, 128],
-    BLOCK_K=[64, 128, 256],
+    BLOCK_K=[128, 256],
     threads=[128, 256],
     num_stages=[2, 3],
     condition=lambda x:
@@ -67,8 +74,8 @@ _MNK_configs = _make_configs(
 )
 
 _MNK_configs_prec = _make_configs(
-    BLOCK_M=[32, 64],
-    BLOCK_N=[16, 32, 64],
+    BLOCK_M=[32, 64, 128],
+    BLOCK_N=[32, 64],
     BLOCK_K=[32, 64, 128],
     threads=[128, 256],
     num_stages=[2, 3],
@@ -80,25 +87,40 @@ _MNK_configs_prec = _make_configs(
 _MNK_configs_packed = _make_configs(
     BLOCK_M=[128, 256],
     BLOCK_N=[64, 128],
-    BLOCK_K=[64, 128, 256],
+    BLOCK_K=[128, 256],
     threads=[128, 256],
     num_stages=[2, 3],
     condition=lambda x:
-        max(x["BLOCK_M"], x["BLOCK_N"]) >= 64
-        and (x["BLOCK_M"] + x["BLOCK_N"]) * x["BLOCK_K"] * x["num_stages"] <= 98304
+        (x["BLOCK_M"] + x["BLOCK_N"]) * x["BLOCK_K"] * x["num_stages"] <= 98304
         and x["BLOCK_M"] >= x["BLOCK_N"]
 )
 
 _MNK_configs_packed_prec = _make_configs(
-    BLOCK_M=[32, 64],
-    BLOCK_N=[16, 32, 64],
-    BLOCK_K=[32, 64, 128],
-    threads=[128, 256, 384],
+    BLOCK_M=[32, 64, 128],
+    BLOCK_N=[32, 64],
+    BLOCK_K=[64, 128],
+    threads=[128, 256],
     num_stages=[2, 3],
     condition=lambda x:
         max(x["BLOCK_M"], x["BLOCK_N"]) >= 32
         and (x["BLOCK_M"] + x["BLOCK_N"]) * x["BLOCK_K"] * x["num_stages"] <= 49152
         and x["BLOCK_M"] >= x["BLOCK_N"]
+)
+
+_BLOCKQ_gemm_configs = [
+    {'threads':  64, 'num_stages': 1},
+    {'threads': 128, 'num_stages': 1},
+    {'threads': 256, 'num_stages': 1},
+    {'threads': 512, 'num_stages': 1},
+    {'threads':  64, 'num_stages': 2},
+    {'threads': 128, 'num_stages': 2},
+    {'threads': 256, 'num_stages': 2},
+    {'threads':  64, 'num_stages': 3},
+]
+
+_BLOCKQ_mem_configs = _make_configs(
+    threads=[128, 256, 512],
+    condition=lambda x: 1
 )
 
 tune_mem = tilelang.autotune(
@@ -125,6 +147,14 @@ tune_gemm_packed_prec = tilelang.autotune(
                 configs=_MNK_configs_packed_prec, warmup=1, rep=3, timeout=4
             )
 
+tune_gemm_blockq = tilelang.autotune(
+                configs=_BLOCKQ_gemm_configs, warmup=1, rep=3, timeout=4
+            )
+
+tune_mem_blockq = tilelang.autotune(
+                configs=_BLOCKQ_mem_configs, warmup=1, rep=3, timeout=4
+            )
+
 kernel_map = [
     (_sumsq_maxabs, tune_mem),
     (_scale_int8, tune_mem),
@@ -141,6 +171,12 @@ kernel_map = [
     (_aat_prec, tune_gemm_packed_prec),
     (_quad_prec, tune_gemm_packed_prec),
     (_ab_symm_prec, tune_gemm_packed_prec),
+    (_to_bq, tune_mem_blockq),
+    (_aat_bq, tune_gemm_blockq),
+    (_quad_bq, tune_gemm_blockq),
+    (_typeii_typei_bq, tune_gemm_blockq),
+    (_typeii_typei_final_bq, tune_gemm_blockq),
+    (_ab_symm_bq, tune_gemm_blockq),
 ]
 
 def _prec2dtype(prec: str):
@@ -150,7 +186,12 @@ class NSInt8:
     def __init__(self, autotune: bool = False):
         self.autotune = autotune
         for (fn, tuner) in kernel_map:
-            setattr(self, '_Z_'+fn.__name__, tuner(tilelang.jit(fn)) if autotune else tilelang.jit(fn))
+            setattr(
+                self, '_Z_'+fn.__name__, 
+                tuner(tilelang.jit(fn, pass_configs=_CONF)) 
+                if autotune else 
+                tilelang.jit(fn, pass_configs=_CONF)
+            )
 
     def __getattr__(self, name):
         @cache
@@ -415,6 +456,121 @@ class NSInt8:
         X_out = Y.to(X.dtype)
 
         return X_out
+    
+
+
+    def _gram_bq(
+        self,
+        X: torch.Tensor,
+        coeffs: list | None = None,
+        eps: float = 1e-7,
+        deterministic: bool = True,
+        precision: str = 'float16'
+    ) -> torch.Tensor:
+        r"""Gram-form fp16 Newton-Schulz orthogonalisation."""
+        if coeffs is None:
+            coeffs = _DEFAULT_NS_COEFFS
+
+        X = X.contiguous()
+        ROW, COL = X.shape
+        L = min(ROW, COL)
+        H = max(ROW, COL)
+        LQ = _cdiv(L, BLOCK_Q)
+        HQ = _cdiv(H, BLOCK_Q)
+        dtype_str = str(X.dtype).split(".")[-1]
+        dev = X.device
+
+        # ── pre-allocate ──
+        A = torch.empty((ROW, COL), device=dev, dtype=_prec2dtype(precision))
+        A_scale = torch.empty((_cdiv(ROW, BLOCK_Q), _cdiv(COL, BLOCK_Q)), device=dev, dtype=torch.float32)
+
+        R = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
+        R_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
+        R_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+
+        Y = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
+        Y_scale = torch.empty((LQ, HQ), device=dev, dtype=torch.float32)
+
+        QQ = torch.as_strided(Y, (L, L), (L, 1))
+        QQ_scale = torch.as_strided(Y_scale, (LQ, LQ), (LQ, 1))
+        QQ_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+
+
+        # QQ = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
+        Z = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
+        Z_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
+        Z_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+
+        Q = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
+        Q_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
+        Q_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+
+        O = torch.empty((L, H), device=dev, dtype=torch.float32)
+        # ── Step 1: Frobenius norm + int8 quantise ──
+        # self._sumsq_maxabs(M=ROW, N=COL, dtype=dtype_str)(X, A_max, A_square_sum)
+        A_frob_norm = torch.linalg.vector_norm(X).view(1)
+        self._to_bq(
+            M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps,
+        )(X, A_frob_norm, A, A_scale)
+
+        # ── Step 2: Transpose trick: make it L×H with L = min ──
+        transposed = ROW > COL
+        if transposed:
+            A = A.mT.contiguous()
+            A_scale = A_scale.mT.contiguous()
+        
+        QQA = torch.as_strided(A, (L, L), (L, 1))
+        QQA_scale = torch.as_strided(A_scale, (LQ, LQ), (LQ, 1))
+
+        # ── Step 3: R = A @ A^T (Gram matrix in Type2) ──
+        self._aat_bq(M=L, K=H, dtype=precision)(A, A_scale, R, R_scale, R_diag)
+
+        # ── Step 4: unrolled iterations ──
+        #  kind: "i"(init t=0), "r"(restart), "n"(normal), "e"(end)
+        for t in range(len(coeffs)):
+            a, b, c = coeffs[t]
+            a *= 0.997
+            b *= 0.997
+            c *= 0.997
+            kind = ("i" if t == 0
+                    else "e" if t == len(coeffs) - 1
+                    else "r" if (t + len(coeffs)) % 2 == 0
+                    else "n")
+
+            if kind == "r":
+                # Y = Q @ X
+                self._typeii_typei_bq(M=L, N=H, dtype=precision)(Q, Q_scale, Q_diag, A, A_scale, Y, Y_scale)
+                # R = Y @ Y^T  (recompute Gram)
+                self._aat_bq(M=L, K=H, dtype=precision)(Y, Y_scale, R, R_scale, R_diag)
+                
+                A, A_scale, Y, Y_scale = Y, Y_scale, A, A_scale
+                QQ, QQ_scale, QQA, QQA_scale = QQA, QQA_scale, QQ, QQ_scale
+
+            if kind in ("i", "r"):
+                # Q = Quad(R)
+                self._quad_bq(M=L, dtype=precision)(R, R_scale, R_diag, Q, Q_scale, Q_diag, a, b, c)
+                # RZ = R @ Q  (Q holds Z)
+                self._ab_symm_bq(M=L, dtype=precision)(R, R_scale, R_diag, Q, Q_scale, Q_diag, QQ, QQ_scale, QQ_diag)
+                # R = Q @ RZ
+                self._ab_symm_bq(M=L, dtype=precision)(Q, Q_scale, Q_diag, QQ, QQ_scale, QQ_diag, R, R_scale, R_diag)
+            else:  # "n" or "e"
+                # Z = Quad(R)
+                self._quad_bq(M=L, dtype=precision)(R, R_scale, R_diag, Z, Z_scale, Z_diag, a, b, c)
+                # Q = Z @ Q 
+                self._ab_symm_bq(M=L, dtype=precision)(Z, Z_scale, Z_diag, Q, Q_scale, Q_diag, QQ, QQ_scale, QQ_diag)
+                torch._foreach_copy_((Q, Q_scale, Q_diag), (QQ, QQ_scale, QQ_diag))
+                if kind == "n":
+                    # RZ = R @ Z
+                    self._ab_symm_bq(M=L, dtype=precision)(R, R_scale, R_diag, Z, Z_scale, Z_diag, QQ, QQ_scale, QQ_diag)
+                    # R = Z @ RZ
+                    self._ab_symm_bq(M=L, dtype=precision)(Z, Z_scale, Z_diag, QQ, QQ_scale, QQ_diag, R, R_scale, R_diag)
+
+        # ── Step 5: X_out = Q_final @ X ──
+        self._typeii_typei_final_bq(M=L, N=H, dtype=precision)(Q, Q_scale, Q_diag, A, A_scale, O)
+        OO = O.to(X.dtype)
+        if transposed:
+            OO = OO.mT.contiguous()
+        return OO
     # ═══════════════════════════════════════════════════════════════
     #  Public:  regular  (standard Newton-Schulz)
     # ═══════════════════════════════════════════════════════════════
@@ -578,4 +734,74 @@ class NSInt8:
             else:
                 A, C = C, A
                 AA, AAA = AAA, AA
+        raise RuntimeError("unreachable")
+    
+    def _regular_bq(
+        self,
+        X: torch.Tensor,
+        coeffs: list | None = None,
+        eps: float = 1e-7,
+        deterministic: bool = True,
+        precision: str = 'float8_e4m3fn'
+    ) -> torch.Tensor:
+
+        if coeffs is None:
+            coeffs = _DEFAULT_NS_COEFFS
+
+        assert len(X.shape) == 2
+        X = X.contiguous()
+        ROW, COL = X.shape
+        dev = X.device
+        dtype_str = str(X.dtype).split(".")[-1]
+        L = min(ROW, COL)
+        H = max(ROW, COL)
+        LQ = _cdiv(L, BLOCK_Q)
+        HQ = _cdiv(H, BLOCK_Q)
+        
+        A = torch.empty((ROW, COL), device=dev, dtype=_prec2dtype(precision))
+        A_scale = torch.empty((_cdiv(ROW, BLOCK_Q), _cdiv(COL, BLOCK_Q)), device=dev, dtype=torch.float32)
+
+        B = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
+        B_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
+        B_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+        
+        C = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
+        C_scale = torch.empty((LQ, HQ), device=dev, dtype=torch.float32)
+
+        AA = torch.as_strided(C, (L, L), (L, 1))
+        AA_scale = torch.as_strided(C_scale, (LQ, LQ), (LQ, 1))
+        AA_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+        
+        AAA = torch.as_strided(A, (L, L), (L, 1))
+        AAA_scale = torch.as_strided(A_scale, (LQ, LQ), (LQ, 1))
+
+        Z = torch.empty((L, H), device=dev, dtype=torch.float32)
+
+        A_frob_norm = torch.linalg.vector_norm(X).view(1)
+        self._to_bq(
+            M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
+        )(X, A_frob_norm, A, A_scale)
+
+        transposed = ROW > COL
+        if transposed:
+            A = A.mT.contiguous()
+            A_scale = A_scale.mT.contiguous()
+
+        # ── main loop ──
+        N_iter = len(coeffs)
+        for i in range(N_iter):
+            a, b, c = coeffs[i]
+            self._aat_bq(M=L, K=H, dtype=precision)(A, A_scale, AA, AA_scale, AA_diag)
+            self._quad_bq(M=L, dtype=precision)(AA, AA_scale, AA_diag, B, B_scale, B_diag, a, b, c)
+            if i == N_iter - 1:
+                self._typeii_typei_final_bq(M=L, N=H, dtype=precision)(B, B_scale, B_diag, A, A_scale, Z)
+                Z = Z.to(X.dtype)
+                if transposed:
+                    Z = Z.mT.contiguous()
+                return Z
+            else:
+                self._typeii_typei_bq(M=L, N=H, dtype=precision)(B, B_scale, B_diag, A, A_scale, C, C_scale)
+                A, A_scale, C, C_scale = C, C_scale, A, A_scale
+                AA, AA_scale, AAA, AAA_scale, = AAA, AAA_scale, AA, AA_scale
+
         raise RuntimeError("unreachable")

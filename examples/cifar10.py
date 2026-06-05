@@ -84,7 +84,7 @@ def run(hidden):
         lr=0.001, 
         momentum=(0.95, 0.95), 
         weight_decay=0.01,
-        precision="INT8",
+        precision="fp8",
         autotune=False,
         use_gram=False,
         use_cuda_graph=True
@@ -129,9 +129,9 @@ def run(hidden):
 
 # ─── Main ───
 if __name__ == "__main__":
-    try:
-        final_acc = run(HIDDEN)
-        print(f"\nFinal Test Accuracy: {final_acc:.2f}%")
-    except Exception as e:
-        print(f"Error occurred: {e}")
-        sys.exit(1)
+    # try:
+    final_acc = run(HIDDEN)
+    print(f"\nFinal Test Accuracy: {final_acc:.2f}%")
+    # except Exception as e:
+    #     print(f"Error occurred: {e}")
+    #     sys.exit(1)

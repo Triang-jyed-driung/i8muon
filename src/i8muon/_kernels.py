@@ -1,4 +1,5 @@
 
+import tilelang
 import tilelang.language as T
 import torch
 ####################### Norm & int8 #################################################
@@ -829,11 +830,454 @@ def _ab_symm_prec(M: int = 4096,
     return _ab_symm_prec_
 
 
+BLOCK_Q = 128
+
+############### - Block Quantized FP8 / INT8 - ##################################################################33
+
+def _to_bq(
+    M: int = 4096, N: int=6144, 
+    threads: int = 128,
+    dtype: str = 'float32',
+    dtype2: str = 'float32',
+    dtype_out: str = 'float8_e4m3fn',
+    use_norm: bool = False,
+    eps: float = 1e-7,
+):
+    assert dtype_out in ['float8_e4m3fn', 'float8_e4m3', 'int8']
+    md = T.ceildiv(M, BLOCK_Q)
+    nd = T.ceildiv(N, BLOCK_Q)
+    DTYPE_MAX = 448 if 'float8_e4m3' in dtype_out else 127 
+    @T.prim_func
+    def _to_bq_(
+        # input
+        A: T.Tensor((M, N), dtype), # type: ignore
+        A_sumsq_or_norm: T.Tensor((1,), dtype2), # type: ignore
+        # output
+        A_bq: T.Tensor((M, N), dtype_out),  # type: ignore
+        A_scale: T.Tensor((md, nd), T.float32) # type: ignore
+    ):
+        with T.Kernel(nd, md, threads=threads) as (pid_n, pid_m):
+            A_scale_1 = T.alloc_var(T.float32)
+            A_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
+            T.fill(A_scale_2, 0)
+            A_scale_1 = 1.0 / T.max(
+                T.cast(A_sumsq_or_norm[0], T.float32) if use_norm else T.sqrt(T.cast(A_sumsq_or_norm[0], T.float32)), 
+                eps
+            )
+            A_local = T.alloc_fragment((BLOCK_Q, BLOCK_Q), T.float32)
+            T.copy(A[pid_m * BLOCK_Q, pid_n * BLOCK_Q], A_local)
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                A_local[i, j] = A_local[i, j] * A_scale_1
+                A_scale_2[0] = T.max(A_scale_2[0], T.abs(A_local[i, j]))
+            T.finalize_reducer(A_scale_2)
+            A_scale_1 = DTYPE_MAX / A_scale_2[0]
+            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+                A_scale[pid_m, pid_n] = 1 / A_scale_1
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                A_local[i, j] = A_local[i, j] * A_scale_1
+            T.copy(A_local, A_bq[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+    return _to_bq_
+
+
+def _aat_bq(
+    M: int = 4096, K: int = 6144,
+    threads: int = 128, num_stages: int = 3,
+    dtype: str = 'float8_e4m3fn'
+):
+    md = T.ceildiv(M, BLOCK_Q)
+    kd = T.ceildiv(K, BLOCK_Q)
+    total_blocks = md * (md + 1) // 2
+
+    DTYPE_MAX = 448 if 'float8_e4m3' in dtype else 127 
+    accum_dtype = 'float32' if 'float8_e4m3' in dtype else 'int32'
+
+    @T.prim_func
+    def _aat_bq_(
+        # input
+        A: T.Tensor((M, K), dtype), # type: ignore
+        A_scale: T.Tensor((md, kd), 'float32'), # type: ignore
+        # output
+        C: T.Tensor((M, M), dtype), # type: ignore
+        # output (init to 0) 
+        C_scale: T.Tensor((md, md), 'float32'), # type: ignore
+        C_diag: T.Tensor((M,), 'float32'), # type: ignore
+    ):
+        with T.Kernel(total_blocks, threads=threads) as (pid,):
+            pid_m = T.alloc_var(T.int32)
+            pid_m = T.cast(T.sqrt(8.0 * T.cast(pid, T.float32) + 1.0)*0.5 - 0.5, T.int32)
+            pid_n = pid - (pid_m * (pid_m + 1) // 2)
+            T.assume(pid_m >= 0)
+            T.assume(pid_n >= 0)
+            T.assume(pid_m < T.ceildiv(M, BLOCK_Q))
+            T.assume(pid_n < T.ceildiv(M, BLOCK_Q))
+            T.assume(md == T.ceildiv(M, BLOCK_Q))
+            T.assume(kd == T.ceildiv(K, BLOCK_Q))
+            # if pid_n >= T.ceildiv(M, BLOCK_N):
+            #     T.thread_return()
+            A_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            B_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            C_local = T.alloc_fragment((BLOCK_Q, BLOCK_Q), accum_dtype)
+            C_float = T.alloc_fragment((BLOCK_Q, BLOCK_Q), T.float32)
+            A_scale_1 = T.alloc_var(T.float32)
+            T.clear(C_float)
+            # Compute Tile
+            for k in T.Pipelined(kd, num_stages=num_stages):
+                T.clear(C_local)
+                T.copy(A[pid_m * BLOCK_Q, k * BLOCK_Q], A_shared)
+                T.copy(A[pid_n * BLOCK_Q, k * BLOCK_Q], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                A_scale_1 = A_scale[pid_m, k] * A_scale[pid_n, k]
+                for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                    C_float[i, j] = T.cast(C_local[i, j], T.float32) * A_scale_1 + C_float[i, j]        
+            
+            C_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
+            T.fill(C_scale_2, 0)
+            if pid_m == pid_n:
+                for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                    if i == j:
+                        C_diag[pid_m * BLOCK_Q + i] = C_float[i, j]
+                        C_float[i, j] = 0
+                    else:
+                        C_scale_2[0] = T.max(C_scale_2[0], T.abs(C_float[i, j]))
+            else:
+                for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                    C_scale_2[0] = T.max(C_scale_2[0], T.abs(C_float[i, j]))
+            T.finalize_reducer(C_scale_2)
+            
+            A_scale_1 = DTYPE_MAX / C_scale_2[0]
+            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+                C_scale[pid_m, pid_n] = 1 / A_scale_1
+                C_scale[pid_n, pid_m] = 1 / A_scale_1
+
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                C_float[i, j] *= A_scale_1
+            
+            C_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            D_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            if pid_m != pid_n:
+                T.copy(C_float, C_shared)
+                T.copy(C_shared, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+                T.transpose(C_shared, D_shared)
+                T.copy(D_shared, C[pid_n * BLOCK_Q, pid_m * BLOCK_Q])
+            else:
+                T.copy(C_float, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+
+    return _aat_bq_
+
+
+def _quad_bq(
+    M: int = 4096,
+    threads: int = 128, num_stages: int = 3,
+    dtype: str = 'float8_e4m3fn',
+):
+    md = T.ceildiv(M, BLOCK_Q)
+    total_blocks = md * (md + 1) // 2
+
+    DTYPE_MAX = 448 if 'float8_e4m3' in dtype else 127 
+    accum_dtype = 'float32' if 'float8_e4m3' in dtype else 'int32'
+    
+    @T.prim_func
+    def _quad_bq_(
+        A: T.Tensor((M, M), dtype),  # type: ignore
+        A_scale: T.Tensor((md, md), 'float32'), # type: ignore
+        A_diag: T.Tensor((M,), 'float32'), # type: ignore
+        C: T.Tensor((M, M), dtype),  # type: ignore
+        C_scale: T.Tensor((md, md), 'float32'), # type: ignore
+        C_diag: T.Tensor((M,), 'float32'), # type: ignore
+        C0: T.float32,
+        C1: T.float32,
+        C2: T.float32
+    ):
+        with T.Kernel(total_blocks, threads=threads) as (pid,):
+            pid_m = T.alloc_var(T.int32)
+            pid_m = T.cast(T.sqrt(8.0 * T.cast(pid, T.float32) + 1.0)*0.5 - 0.5, T.int32)
+            pid_n = pid - (pid_m * (pid_m + 1) // 2)
+            T.assume(pid_m >= 0)
+            T.assume(pid_n >= 0)
+            T.assume(pid_m < md)
+            T.assume(pid_n < md)
+
+            A_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            B_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            A_diag_shared = T.alloc_shared((BLOCK_Q,), T.float32)
+            B_diag_shared = T.alloc_shared((BLOCK_Q,), T.float32)
+            C_local = T.alloc_fragment((BLOCK_Q, BLOCK_Q), accum_dtype)
+            C_float = T.alloc_fragment((BLOCK_Q, BLOCK_Q), T.float32)
+            A_scale_1 = T.alloc_var(T.float32)
+
+            T.clear(C_float)
+            for k in T.Pipelined(md, num_stages=num_stages):
+                T.clear(C_local)
+                T.copy(A[pid_m * BLOCK_Q, k * BLOCK_Q], A_shared)
+                T.copy(A[pid_n * BLOCK_Q, k * BLOCK_Q], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                A_scale_1 = A_scale[pid_m, k] * A_scale[pid_n, k]
+                for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                    C_float[i, j] = T.cast(C_local[i, j], T.float32) * A_scale_1 + C_float[i, j] 
+
+            T.copy(A_diag[pid_m * BLOCK_Q], A_diag_shared)
+            T.copy(A_diag[pid_n * BLOCK_Q], B_diag_shared)
+            A_shared_2 = T.alloc_fragment((BLOCK_Q, BLOCK_Q), dtype)
+            A_scale_1 = A_scale[pid_m, pid_n]
+            T.copy(A[pid_m * BLOCK_Q, pid_n * BLOCK_Q], A_shared_2)
+            is_diag = T.alloc_var(T.bool)
+            is_diag = pid_m == pid_n
+
+            C_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
+            T.fill(C_scale_2, 0)
+            ai = T.alloc_var(T.float32)
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                ai = A_diag_shared[i]
+                C_float[i, j] += (ai + B_diag_shared[j]) * (A_scale_1 * A_shared_2[i, j])
+                C_float[i, j] *= C2
+                C_float[i, j] += (A_scale_1 * A_shared_2[i, j]) * C1
+                if is_diag and i == j:
+                    C_diag[pid_m * BLOCK_Q + i] = C_float[i, j] + (C0 + ai * (C1 + ai * C2))
+                    C_float[i, j] = 0
+                else:
+                    C_scale_2[0] = T.max(C_scale_2[0], T.abs(C_float[i, j]))
+            T.finalize_reducer(C_scale_2)
+
+            A_scale_1 = DTYPE_MAX / C_scale_2[0]
+            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+                C_scale[pid_m, pid_n] = 1 / A_scale_1
+                C_scale[pid_n, pid_m] = 1 / A_scale_1
+
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                C_float[i, j] *= A_scale_1
+            
+            C_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            D_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            if pid_m != pid_n:
+                T.copy(C_float, C_shared)
+                T.copy(C_shared, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+                T.transpose(C_shared, D_shared)
+                T.copy(D_shared, C[pid_n * BLOCK_Q, pid_m * BLOCK_Q])
+            else:
+                T.copy(C_float, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+    return _quad_bq_
+
+def _typeii_typei_bq(
+    M: int = 4096, N: int= 6144,
+    threads: int = 128, num_stages: int = 3,
+    dtype: str = 'float8_e4m3fn'
+):
+    md = T.ceildiv(M, BLOCK_Q)
+    nd = T.ceildiv(N, BLOCK_Q)
+
+    DTYPE_MAX = 448 if 'float8_e4m3' in dtype else 127 
+    accum_dtype = 'float32' if 'float8_e4m3' in dtype else 'int32'
+    @T.prim_func
+    def _typeii_typei_bq_(
+        A:       T.Tensor((M, M),   dtype),     # type: ignore
+        A_scale: T.Tensor((md, md), T.float32), # type: ignore
+        A_diag:  T.Tensor((M,),     T.float32), # type: ignore
+        B:       T.Tensor((M, N),   dtype),     # type: ignore
+        B_scale: T.Tensor((md, nd), T.float32), # type: ignore
+        # B_diag: T.Tensor((M,), T.float32),
+        C:       T.Tensor((M, N),   dtype),     # type: ignore
+        C_scale: T.Tensor((md, nd), T.float32), # type: ignore
+    ):
+        with T.Kernel(nd, md, threads=threads) as (pid_n, pid_m):
+            A_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            B_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            row_shared = T.alloc_shared((BLOCK_Q,), T.float32)
+            C_local = T.alloc_fragment((BLOCK_Q, BLOCK_Q), accum_dtype)
+            C_float = T.alloc_fragment((BLOCK_Q, BLOCK_Q), T.float32)
+            A_scale_1 = T.alloc_var(T.float32)
+
+            T.clear(C_float)
+            for k in T.Pipelined(md, num_stages=num_stages):
+                T.clear(C_local)
+                T.copy(A[pid_m * BLOCK_Q, k * BLOCK_Q], A_shared)
+                T.copy(B[k * BLOCK_Q, pid_n * BLOCK_Q], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+                A_scale_1 = A_scale[pid_m, k] * B_scale[k, pid_n]
+                for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                    C_float[i, j] = T.cast(C_local[i, j], T.float32) * A_scale_1 + C_float[i, j]
+
+            B8 = T.alloc_fragment((BLOCK_Q, BLOCK_Q), dtype)
+            T.copy(A_diag[pid_m * BLOCK_Q], row_shared)
+            T.copy(B[pid_m * BLOCK_Q, pid_n * BLOCK_Q], B8)
+            B_var = T.alloc_var(T.float32)
+            B_var = B_scale[pid_m, pid_n]
+            # A_var_beta = A_var * BETA
+            Cmax_reducer = T.alloc_reducer((1,), T.float32, op='max', replication="all")
+            T.fill(Cmax_reducer, 0)
+            for (i, j) in T.Parallel(BLOCK_Q, BLOCK_Q):
+                C_float[i, j] += (T.cast(B8[i,j], T.float32) * row_shared[i]) * B_var
+                val = T.abs(C_float[i, j])
+                Cmax_reducer[0] = T.max(val, Cmax_reducer[0])
+            T.finalize_reducer(Cmax_reducer)
+
+            A_scale_1 = DTYPE_MAX / Cmax_reducer[0]
+            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+                C_scale[pid_m, pid_n] = 1 / A_scale_1
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                C_float[i, j] = C_float[i, j] * A_scale_1
+            T.copy(C_float, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+            
+    return _typeii_typei_bq_
+
+
+def _typeii_typei_final_bq(
+    M: int = 4096, N: int= 6144,
+    threads: int = 128, num_stages: int = 3,
+    dtype: str = 'float8_e4m3fn',
+    dtype2: str = 'float32',
+):
+    md = T.ceildiv(M, BLOCK_Q)
+    nd = T.ceildiv(N, BLOCK_Q)
+    accum_dtype = 'float32' if 'float8_e4m3' in dtype else 'int32'
+
+    @T.prim_func
+    def _typeii_typei_final_bq_(
+        A:       T.Tensor((M, M), dtype), # type: ignore
+        A_scale: T.Tensor((md, md), T.float32), # type: ignore
+        A_diag:  T.Tensor((M,), T.float32), # type: ignore
+        B:       T.Tensor((M, N), dtype), # type: ignore
+        B_scale: T.Tensor((md, nd), T.float32), # type: ignore
+        # B_diag: T.TensNor((M,), T.float32),
+        C:       T.Tensor((M, N), dtype2), # type: ignore
+    ):
+        with T.Kernel(nd, md, threads=threads) as (pid_n, pid_m):
+            A_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            B_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            row_shared = T.alloc_shared((BLOCK_Q,), T.float32)
+            C_local = T.alloc_fragment((BLOCK_Q, BLOCK_Q), accum_dtype)
+            C_float = T.alloc_fragment((BLOCK_Q, BLOCK_Q), T.float32)
+            A_scale_1 = T.alloc_var(T.float32)
+
+            T.clear(C_float)
+            for k in T.Pipelined(md, num_stages=num_stages):
+                T.clear(C_local)
+                T.copy(A[pid_m * BLOCK_Q, k * BLOCK_Q], A_shared)
+                T.copy(B[k * BLOCK_Q, pid_n * BLOCK_Q], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+                A_scale_1 = A_scale[pid_m, k] * B_scale[k, pid_n]
+                for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                    C_float[i, j] = T.cast(C_local[i, j], T.float32) * A_scale_1 + C_float[i, j]
+
+            B8 = T.alloc_fragment((BLOCK_Q, BLOCK_Q), dtype)
+            T.copy(A_diag[pid_m * BLOCK_Q], row_shared)
+            T.copy(B[pid_m * BLOCK_Q, pid_n * BLOCK_Q], B8)
+            B_var = T.alloc_var(T.float32)
+            B_var = B_scale[pid_m, pid_n]
+
+            for (i, j) in T.Parallel(BLOCK_Q, BLOCK_Q):
+                C_float[i, j] += (T.cast(B8[i,j], T.float32) * row_shared[i]) * B_var
+
+            T.copy(C_float, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+
+    return _typeii_typei_final_bq_
+
+
+def _ab_symm_bq(
+    M: int = 4096,
+    threads: int = 128, num_stages: int = 3,
+    dtype: str = 'float8_e4m3fn',
+):
+    md = T.ceildiv(M, BLOCK_Q)
+    total_blocks = md * (md + 1) // 2
+
+    DTYPE_MAX = 448 if 'float8_e4m3' in dtype else 127 
+    accum_dtype = 'float32' if 'float8_e4m3' in dtype else 'int32'
+    
+    @T.prim_func
+    def _ab_symm_bq_(
+        A: T.Tensor((M, M), dtype),  # type: ignore
+        A_scale: T.Tensor((md, md), 'float32'), # type: ignore
+        A_diag: T.Tensor((M,), 'float32'), # type: ignore
+        B: T.Tensor((M, M), dtype),  # type: ignore
+        B_scale: T.Tensor((md, md), 'float32'), # type: ignore
+        B_diag: T.Tensor((M,), 'float32'), # type: ignore
+        C: T.Tensor((M, M), dtype),  # type: ignore
+        C_scale: T.Tensor((md, md), 'float32'), # type: ignore
+        C_diag: T.Tensor((M,), 'float32'), # type: ignore
+    ):
+        with T.Kernel(total_blocks, threads=threads) as (pid,):
+            pid_m = T.alloc_var(T.int32)
+            pid_m = T.cast(T.sqrt(8.0 * T.cast(pid, T.float32) + 1.0)*0.5 - 0.5, T.int32)
+            pid_n = pid - (pid_m * (pid_m + 1) // 2)
+            T.assume(pid_m >= 0)
+            T.assume(pid_n >= 0)
+            T.assume(pid_m < md)
+            T.assume(pid_n < md)
+
+            A_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            B_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            A_diag_shared = T.alloc_shared((BLOCK_Q,), T.float32)
+            B_diag_shared = T.alloc_shared((BLOCK_Q,), T.float32)
+            C_local = T.alloc_fragment((BLOCK_Q, BLOCK_Q), accum_dtype)
+            C_float = T.alloc_fragment((BLOCK_Q, BLOCK_Q), T.float32)
+            A_scale_1 = T.alloc_var(T.float32)
+            B_scale_1 = T.alloc_var(T.float32)
+
+            T.clear(C_float)
+            for k in T.Pipelined(md, num_stages=num_stages):
+                T.clear(C_local)
+                T.copy(A[pid_m * BLOCK_Q, k * BLOCK_Q], A_shared)
+                T.copy(B[pid_n * BLOCK_Q, k * BLOCK_Q], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                A_scale_1 = A_scale[pid_m, k] * B_scale[pid_n, k]
+                for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                    C_float[i, j] = T.cast(C_local[i, j], T.float32) * A_scale_1 + C_float[i, j] 
+
+            T.copy(A_diag[pid_m * BLOCK_Q], A_diag_shared)
+            T.copy(B_diag[pid_n * BLOCK_Q], B_diag_shared)
+            A_shared_2 = T.alloc_fragment((BLOCK_Q, BLOCK_Q), dtype)
+            B_shared_2 = T.alloc_fragment((BLOCK_Q, BLOCK_Q), dtype)
+            A_scale_1 = A_scale[pid_m, pid_n]
+            B_scale_1 = B_scale[pid_m, pid_n]
+            T.copy(A[pid_m * BLOCK_Q, pid_n * BLOCK_Q], A_shared_2)
+            T.copy(B[pid_m * BLOCK_Q, pid_n * BLOCK_Q], B_shared_2)
+            
+            is_diag = T.alloc_var(T.bool)
+            is_diag = pid_m == pid_n
+
+            C_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
+            T.fill(C_scale_2, 0)
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                C_float[i, j] += (
+                    B_diag_shared[j] * A_scale_1 * A_shared_2[i, j] 
+                    + A_diag_shared[i] * B_scale_1 * B_shared_2[i, j]
+                )
+                if is_diag and i == j:
+                    C_diag[pid_m * BLOCK_Q + i] = C_float[i, j] + A_diag_shared[i] * B_diag_shared[j]
+                    C_float[i, j] = 0
+                else:
+                    C_scale_2[0] = T.max(C_scale_2[0], T.abs(C_float[i, j]))
+            T.finalize_reducer(C_scale_2)
+
+            A_scale_1 = DTYPE_MAX / C_scale_2[0]
+            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+                C_scale[pid_m, pid_n] = 1 / A_scale_1
+                C_scale[pid_n, pid_m] = 1 / A_scale_1
+
+            for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
+                C_float[i, j] *= A_scale_1
+            
+            C_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            D_shared = T.alloc_shared((BLOCK_Q, BLOCK_Q), dtype)
+            if pid_m != pid_n:
+                T.copy(C_float, C_shared)
+                T.copy(C_shared, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+                T.transpose(C_shared, D_shared)
+                T.copy(D_shared, C[pid_n * BLOCK_Q, pid_m * BLOCK_Q])
+            else:
+                T.copy(C_float, C[pid_m * BLOCK_Q, pid_n * BLOCK_Q])
+    return _ab_symm_bq_
+
+
+
 __all__ = [
-    '_sumsq_maxabs', '_scale_int8', '_aat_int8_max',
-    '_int32_compl_symm_int8', '_typeii_int8_sq',
-    '_float32_compl_symm_int8_quad', '_typeii_int8_ab',
-    '_float32_ab_to_int8', '_typeii_typei_int8',
-    '_float32_to_int8', '_to_prec', '_ab_prec', '_aat_prec',
-    '_quad_prec', '_ab_symm_prec',
+    # global int8
+    '_sumsq_maxabs', '_scale_int8', '_aat_int8_max', '_int32_compl_symm_int8', '_typeii_int8_sq',
+    '_float32_compl_symm_int8_quad', '_typeii_int8_ab', '_float32_ab_to_int8', '_typeii_typei_int8',
+    '_float32_to_int8', 
+    # fp16/bf16/fp32
+    '_to_prec', '_ab_prec', '_aat_prec', '_quad_prec', '_ab_symm_prec', 
+    # block fp8/int8
+    '_to_bq', '_aat_bq','_quad_bq', '_typeii_typei_bq', '_typeii_typei_final_bq', '_ab_symm_bq',
+    'BLOCK_Q'
 ]
