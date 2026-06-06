@@ -1,5 +1,5 @@
 
-
+import os
 import itertools
 import warnings
 import tilelang
@@ -8,9 +8,12 @@ import torch
 from ._kernels import *
 from functools import cache, lru_cache
 
-
-
-_CONF = {tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True}
+DISABLE_TMA = not int(os.environ.get("I8MUON_USE_TMA", '0'))
+print(f"I8MUON: disable TMA and warp specialization: {DISABLE_TMA}")
+_CONF = {
+    tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: DISABLE_TMA,
+}
 
 
 # pyright: reportAttributeAccessIssue=false
@@ -107,20 +110,13 @@ _MNK_configs_packed_prec = _make_configs(
         and x["BLOCK_M"] >= x["BLOCK_N"]
 )
 
-_BLOCKQ_gemm_configs = [
-    {'threads':  64, 'num_stages': 1},
-    {'threads': 128, 'num_stages': 1},
-    {'threads': 256, 'num_stages': 1},
-    {'threads': 512, 'num_stages': 1},
-    {'threads':  64, 'num_stages': 2},
-    {'threads': 128, 'num_stages': 2},
-    {'threads': 256, 'num_stages': 2},
-    {'threads':  64, 'num_stages': 3},
-]
+_BLOCKQ_gemm_configs = _make_configs(
+    threads=[64, 128, 256, 512],
+    num_stages=[0, 1, 2, 3],
+)
 
 _BLOCKQ_mem_configs = _make_configs(
     threads=[128, 256, 512],
-    condition=lambda x: 1
 )
 
 tune_mem = tilelang.autotune(

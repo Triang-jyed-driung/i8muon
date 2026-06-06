@@ -6,8 +6,8 @@ import torch
 
 def _sumsq_maxabs(
     M: int = 4096, N: int=6144, 
-    BLOCK_M: int = 64, BLOCK_N: int = 32, 
-    threads: int = 256,
+    BLOCK_M: int = 64, BLOCK_N: int = 64, 
+    threads: int = 64,
     dtype: str = 'float32'
 ):
     @T.prim_func
@@ -41,7 +41,7 @@ def _sumsq_maxabs(
 
 def _scale_int8(
     M: int = 4096, N: int=6144, 
-    BLOCK_M: int = 128, BLOCK_N: int = 32, 
+    BLOCK_M: int = 8, BLOCK_N: int = 64, 
     threads: int = 256,
     dtype: str = 'float32',
     dtype2: str = 'float32',
@@ -84,7 +84,7 @@ def _scale_int8(
 ####################### AAT & ATA & completion #################################################
 def _aat_int8_max(
     M: int = 4096, K: int = 6144,
-    BLOCK_M: int = 128, BLOCK_N: int = 64, BLOCK_K: int = 128,
+    BLOCK_M: int = 128, BLOCK_N: int = 128, BLOCK_K: int = 128,
     threads: int = 128, num_stages: int = 3,
     dtype: str = 'int8', accum_dtype: str = 'int32'
 ):
@@ -142,7 +142,7 @@ def _aat_int8_max(
 
 def _int32_compl_symm_int8(
     M: int = 4096, 
-    BLOCK_M: int = 64, BLOCK_N: int = 32, 
+    BLOCK_M: int = 64, BLOCK_N: int = 16, 
     threads: int = 256
 ):
     R = BLOCK_M // BLOCK_N
@@ -220,7 +220,7 @@ def _int32_compl_symm_int8(
 def _typeii_int8_sq(
     M: int = 4096,
     BLOCK_M: int = 128, BLOCK_N: int = 64, BLOCK_K: int = 128,
-    threads: int = 128, num_stages: int = 3,
+    threads: int = 128, num_stages: int = 2,
     # ALPHA: float = 0.0,
     # BETA: float = 1.0
 ):
@@ -383,8 +383,8 @@ def _float32_compl_symm_int8_quad(
 
 def _typeii_int8_ab(
     M: int = 4096,
-    BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 256,
-    threads: int = 128, num_stages: int = 3,
+    BLOCK_M: int = 128, BLOCK_N: int = 128, BLOCK_K: int = 128,
+    threads: int = 256, num_stages: int = 3,
 ):
     R = BLOCK_M // BLOCK_N
     U = T.ceildiv(M, BLOCK_M)
@@ -460,7 +460,7 @@ def _typeii_int8_ab(
 
 def _float32_ab_to_int8(
     M: int = 4096, 
-    BLOCK_M: int = 32, BLOCK_N: int = 16, 
+    BLOCK_M: int = 64, BLOCK_N: int = 64, 
     threads: int = 256,
 ):
     R = BLOCK_M // BLOCK_N
@@ -536,8 +536,8 @@ def _float32_ab_to_int8(
 
 def _typeii_typei_int8(
     M: int = 4096, N: int= 6144,
-    BLOCK_M: int = 128, BLOCK_N: int = 64, BLOCK_K: int = 128,
-    threads: int = 128, num_stages: int = 3
+    BLOCK_M: int = 256, BLOCK_N: int = 128, BLOCK_K: int = 128,
+    threads: int = 256, num_stages: int = 2
 ):
     @T.prim_func
     def _typeii_typei_int8_(
@@ -586,8 +586,8 @@ def _typeii_typei_int8(
 
 def _float32_to_int8(
     M: int = 4096, N: int = 4096, 
-    BLOCK_M: int = 32, BLOCK_N: int = 16, 
-    threads: int = 128,
+    BLOCK_M: int = 16, BLOCK_N: int = 64, 
+    threads: int = 512,
 ):
     @T.prim_func
     def _float32_to_int8_(
@@ -616,7 +616,7 @@ def _float32_to_int8(
 
 def _to_prec(
     M: int = 4096, N: int=6144, 
-    BLOCK_M: int = 32, BLOCK_N: int = 16, 
+    BLOCK_M: int = 64, BLOCK_N: int = 64, 
     threads: int = 128,
     dtype: str = 'float32',
     dtype2: str = 'float32',
@@ -647,7 +647,7 @@ def _to_prec(
 
 
 def _ab_prec(M: int, N: int, K: int,
-           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 64,
+           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 128,
            threads: int = 256, num_stages: int = 3,
            dtype: str = 'float16', accum_dtype: str = 'float32'):
     @T.prim_func
@@ -670,7 +670,7 @@ def _ab_prec(M: int, N: int, K: int,
     return _ab_prec_
 
 def _aat_prec(M: int = 4096, K: int = 6144,
-           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 64,
+           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 128,
            threads: int = 256, num_stages: int = 3,
            dtype: str = 'float16', accum_dtype: str = 'float32'):
 
@@ -721,7 +721,7 @@ def _aat_prec(M: int = 4096, K: int = 6144,
 def _quad_prec(
     M: int = 4096,
     BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 64,
-    threads: int = 128, num_stages: int = 3,
+    threads: int = 256, num_stages: int = 3,
     dtype: str = 'float16', accum_dtype: str = 'float32'
 ):
     R = BLOCK_M // BLOCK_N
@@ -780,8 +780,8 @@ def _quad_prec(
     return _quad_prec_
 
 def _ab_symm_prec(M: int = 4096,
-           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 64,
-           threads: int = 256, num_stages: int = 3,
+           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 128,
+           threads: int = 128, num_stages: int = 3,
            dtype: str = 'float16', accum_dtype: str = 'float32'):
 
     R = BLOCK_M // BLOCK_N
@@ -836,7 +836,7 @@ BLOCK_Q = 128
 
 def _to_bq(
     M: int = 4096, N: int=6144, 
-    threads: int = 128,
+    threads: int = 256,
     dtype: str = 'float32',
     dtype2: str = 'float32',
     dtype_out: str = 'float8_e4m3fn',
@@ -881,7 +881,7 @@ def _to_bq(
 
 def _aat_bq(
     M: int = 4096, K: int = 6144,
-    threads: int = 128, num_stages: int = 3,
+    threads: int = 256, num_stages: int = 2,
     dtype: str = 'float8_e4m3fn'
 ):
     md = T.ceildiv(M, BLOCK_Q)
@@ -967,7 +967,7 @@ def _aat_bq(
 
 def _quad_bq(
     M: int = 4096,
-    threads: int = 128, num_stages: int = 3,
+    threads: int = 256, num_stages: int = 2,
     dtype: str = 'float8_e4m3fn',
 ):
     md = T.ceildiv(M, BLOCK_Q)
@@ -1059,7 +1059,7 @@ def _quad_bq(
 
 def _typeii_typei_bq(
     M: int = 4096, N: int= 6144,
-    threads: int = 128, num_stages: int = 3,
+    threads: int = 256, num_stages: int = 2,
     dtype: str = 'float8_e4m3fn'
 ):
     md = T.ceildiv(M, BLOCK_Q)
@@ -1122,7 +1122,7 @@ def _typeii_typei_bq(
 
 def _typeii_typei_final_bq(
     M: int = 4096, N: int= 6144,
-    threads: int = 128, num_stages: int = 3,
+    threads: int = 256, num_stages: int = 2,
     dtype: str = 'float8_e4m3fn',
     dtype2: str = 'float32',
 ):
@@ -1174,7 +1174,7 @@ def _typeii_typei_final_bq(
 
 def _ab_symm_bq(
     M: int = 4096,
-    threads: int = 128, num_stages: int = 3,
+    threads: int = 256, num_stages: int = 2,
     dtype: str = 'float8_e4m3fn',
 ):
     md = T.ceildiv(M, BLOCK_Q)

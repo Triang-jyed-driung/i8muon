@@ -1,2 +1,11 @@
+
+**/__pycache__/
 *.egg-info/
 *.egg-info/*
+i8muon/__pycache__
+i8muon/__pycache__/*
+examples/data
+examples/data/*
+examples/__pycache__
+examples/__pycache__/*
+"**/* copy*"
