@@ -5,8 +5,8 @@ Muon optimizer has recently attracted considerable attention. However, until now
 A GPU-accelerated implementation of the **Muon optimizer** (Keller Jordan, 2024) that replaces the standard Newton-Schulz orthogonalization step with **int8 precision** written in **TileLang**, delivering faster per-step throughput while maintaining accuracy parity with the float reference.
 
 ## Training run
-<img width="1827" height="887" alt="image" src="https://github.com/user-attachments/assets/7dea6ebc-59f3-4f43-9089-7a4e774c123a" />
-A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8 Muon. Stable and no spikes.
+<img width="1641" height="871" alt="image" src="https://github.com/user-attachments/assets/fda52263-d210-4b1f-b2b7-48aeea7e92d4" />
+A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8, fp8 and fp16 Muon. All stable and no spikes.
 
 ## Background
 
