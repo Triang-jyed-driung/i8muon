@@ -801,3 +801,46 @@ class NSInt8:
                 AA, AA_scale, AAA, AAA_scale, = AAA, AAA_scale, AA, AA_scale
 
         raise RuntimeError("unreachable")
+    
+    @cache
+    def router(self, M: int, N: int, precision: str, use_gram: bool, gram_aspect_threshold: float):
+        numel = M * N
+        aspect_ratio = max(M, N) / min(M, N)
+        if precision == 'auto':
+            if numel >= 524288 and aspect_ratio >= 7.0:
+                return self._gram_prec, 'float16'
+            elif numel < 1048576:
+                return self._regular_prec, 'float16'
+            else:
+                return self._regular_i8, 'int8'
+            
+        else:
+            gram_method = (aspect_ratio >= gram_aspect_threshold and use_gram)
+            
+            use_bq = False
+            if precision == "float8_e4m3fn":
+                use_bq = True
+            elif precision == "int8_bq":
+                precision = "int8"
+                use_bq = True
+            
+            if gram_method:
+                if precision in ('float8_e4m3fn', 'int8'):
+                    precision = 'float16'
+                return self._gram_prec, precision
+            else:
+                if use_bq:
+                    return self._regular_bq, precision
+                else:
+                    if precision == 'int8':
+                        return self._regular_i8, 'int8'
+                    else:
+                        return self._regular_prec, precision
+                    
+                        
+            
+
+
+
+
+

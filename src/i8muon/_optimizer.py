@@ -327,31 +327,8 @@ def _single_tensor_muon(
         update = grad.lerp(buf, mu) if nesterov else buf
 
         M, N = update.shape
-        gram_method = (max(M, N) / min(M, N) >= gram_aspect_threshold and use_gram)
-        actual_prec = (
-            ('int8' if 256 <= max(M, N) else 'float16') if precision == 'auto' else precision
-        )
-        if gram_method and actual_prec == 'int8': 
-            actual_prec = 'float16'
-
-        use_bq = False
-        if precision == "float8_e4m3fn":
-            actual_prec = "float8_e4m3fn"
-            use_bq = True
-        if precision == "int8_bq":
-            actual_prec = "int8"
-            use_bq = True
         
-        ns_fn = (
-            (ns_engine._gram_bq if gram_method else ns_engine._regular_bq)
-            if use_bq else
-            ns_engine._gram_prec 
-            if gram_method else 
-            ns_engine._regular_i8
-            if actual_prec == 'int8' else
-            ns_engine._regular_prec
-        )
-
+        ns_fn, actual_prec = ns_engine.router(M, N, precision, use_gram, gram_aspect_threshold)
         def call_ns(u):
             return ns_fn(
                 u, coeffs=ns_coefficients, eps=eps, deterministic=deterministic, precision=actual_prec
