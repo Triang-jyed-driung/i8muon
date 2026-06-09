@@ -4,6 +4,47 @@ Muon optimizer has recently attracted considerable attention. However, until now
 
 A GPU-accelerated implementation of the **Muon optimizer** (Keller Jordan, 2024) that replaces the standard Newton-Schulz orthogonalization step with **int8 precision** written in **TileLang**, delivering faster per-step throughput while maintaining accuracy parity with the float reference.
 
+## Known issues
+
+This is an experimental branch. Read this section before running any kernels.
+
+TileLang's TMA and warp specialization features are experimental.
+
+If you're using TileLang v0.1.11, it is strongly recommended to disable this option:
+```bash
+    export I8MUON_USE_TMA=0
+```
+
+Known issues by version:
+
+1. TileLang 0.1.11 on RTX 5090:
+    - Incorrect results across nearly all int8 and block quantization kernels.
+    - Kernel hangs (sync errors) under almost all block quantization configurations.
+    - The consumer thread layout changes between versions, and TileLang does not expose any API for querying relative thread IDs within a consumer group.
+    - Do not use TMA or warp specialization on this version. `export I8MUON_USE_TMA=0`
+    - Disabling TMA and WS has a 10-15% performance penalty, but should run correctly.
+
+2. TileLang 0.1.10 on RTX 5090 (currently the most stable version):
+    - Kernel hangs (sync errors) in some block quantization configurations. Setting autotune=False avoids most issues, but the default parameters may still fail on certain shapes.
+    - Do not enable autotuning with block quantization kernels.
+
+3. TileLang 0.1.9:
+    - Kernel hangs (sync errors) in some fp16/bf16 (*_prec) kernels on RTX 5090.
+    - Incorrect int8 matrix multiplication results on RTX 4090 for certain shapes, caused by an off-by-one error in cp.async stage calculation.
+    - Upgrade to TileLang 0.1.10.
+
+4. TileLang 0.1.8 and lower:
+    - Some features like tile transpose are missing.
+    - Upgrade to TileLang 0.1.10.
+
+#### If you encounter a kernel hang
+If a kernel has been running for more than two seconds, it is likely hung. To terminate the process, follow these steps:
+
+1. Open `htop`. 
+2. Select the hung process, and press F9 or click "Kill".
+3. Select `SIGTERM`, and press Enter or click "Send".
+4. (Optional) After that, launch a fresh zeroing kernel, like `torch.zeros(4096, device="cuda")` to drop down power usage.
+
 ## Training run
 <img width="1827" height="887" alt="image" src="https://github.com/user-attachments/assets/7dea6ebc-59f3-4f43-9089-7a4e774c123a" />
 A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8 Muon. Stable and no spikes.

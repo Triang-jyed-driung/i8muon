@@ -84,8 +84,8 @@ def _scale_int8(
 ####################### AAT & ATA & completion #################################################
 def _aat_int8_max(
     M: int = 4096, K: int = 6144,
-    BLOCK_M: int = 128, BLOCK_N: int = 128, BLOCK_K: int = 128,
-    threads: int = 128, num_stages: int = 3,
+    BLOCK_M: int = 256, BLOCK_N: int = 128, BLOCK_K: int = 128,
+    threads: int = 256, num_stages: int = 2,
     dtype: str = 'int8', accum_dtype: str = 'int32'
 ):
     R = BLOCK_M // BLOCK_N
@@ -219,8 +219,8 @@ def _int32_compl_symm_int8(
 
 def _typeii_int8_sq(
     M: int = 4096,
-    BLOCK_M: int = 128, BLOCK_N: int = 64, BLOCK_K: int = 128,
-    threads: int = 128, num_stages: int = 2,
+    BLOCK_M: int = 256, BLOCK_N: int = 128, BLOCK_K: int = 128,
+    threads: int = 256, num_stages: int = 2,
     # ALPHA: float = 0.0,
     # BETA: float = 1.0
 ):
