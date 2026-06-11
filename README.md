@@ -8,6 +8,46 @@ A GPU-accelerated implementation of the **Muon optimizer** (Keller Jordan, 2024)
 <img width="1641" height="871" alt="image" src="https://github.com/user-attachments/assets/fda52263-d210-4b1f-b2b7-48aeea7e92d4" />
 A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8, fp8 and fp16 Muon. All stable and no spikes.
 
+## i8muon int8 vs [Gram-Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz) — RTX 5090
+
+Both methods use Newton-Schulz iterations to orthogonalize matrices.
+- **i8muon** applies TileLang autotuned int8 kernels with CUDA graphs.
+- **GNS** uses CuTeDSL symmetric GEMM kernels with `torch.compile` (reduce-overhead) and CUDA graphs.
+- **GNS best** = `min(GNS gram, GNS standard)` per shape.
+- **Speedup** = GNS best / i8muon int8 (>1 means i8muon is faster).
+- All timings are CUDA-event min over 10 measurements after 3 warmup iterations.
+
+**Summary:** i8muon int8 wins 16 of 22 shapes. Total time: 16.10 ms vs 22.02 ms — a **1.37×** overall speedup. GNS holds a slight edge on tall-skinny shapes where M ≫ N (e.g., 2048×512, 3072×1024).
+
+| Shape | i8muon int8 (ms) | GNS best (ms) | GNS standard (ms) | Speedup |
+|-------|-----------------:|--------------:|------------------:|-------------:|
+| 512×512 | 0.1082 | **0.1055** | **0.1055** | 0.98x |
+| 768×768 | **0.1287** | 0.1356 | 0.1364 | 1.05x |
+| 512×1536 | **0.1257** | 0.1301 | 0.1367 | 1.04x |
+| 1536×512 | 0.1430 | **0.1305** | 0.1359 | 0.91x |
+| 512×2048 | **0.1353** | 0.1395 | 0.1543 | 1.03x |
+| 2048×512 | 0.1560 | **0.1377** | 0.1541 | 0.88x |
+| 1024×1024 | **0.1498** | 0.1750 | 0.1750 | 1.17x |
+| 768×2048 | **0.1733** | 0.1870 | 0.2258 | 1.08x |
+| 2048×768 | 0.2036 | **0.1868** | 0.2258 | 0.92x |
+| 1536×1536 | **0.2561** | 0.4347 | 0.4347 | 1.70x |
+| 1024×3072 | **0.2498** | 0.2628 | 0.3410 | 1.05x |
+| 3072×1024 | 0.3101 | **0.2620** | 0.3408 | 0.84x |
+| 2048×2048 | **0.4405** | 1.0492 | 1.0520 | 2.38x |
+| 1536×4096 | **0.5096** | 0.6492 | 0.8704 | 1.27x |
+| 4096×1536 | **0.6267** | 0.6553 | 0.8762 | 1.05x |
+| 2560×2560 | **0.8700** | 1.6445 | 1.6486 | 1.89x |
+| 2048×8192 | **1.1940** | 1.8760 | 2.9338 | 1.57x |
+| 8192×2048 | **1.4848** | 1.8780 | 2.9348 | 1.26x |
+| 2560×7168 | **1.6568** | 2.6460 | 3.8379 | 1.60x |
+| 7168×2560 | **2.0070** | 2.6481 | 3.8308 | 1.32x |
+| 2560×10240 | **2.3326** | 3.3444 | 5.2521 | 1.43x |
+| 10240×2560 | **2.8416** | 3.3444 | 5.2449 | 1.18x |
+
+**Key observations:**
+- Near-tie on tiny matrices (512², 768²); both around 0.1 ms.
+- i8muon pulls ahead at ≥1024² and dominates on large square shapes (2048²: 2.38×, 2560²: 1.89×).
+
 ## Background
 
 ### Muon Optimizer
