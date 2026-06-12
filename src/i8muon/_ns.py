@@ -221,6 +221,25 @@ kernel_map = [
 def _prec2dtype(prec: str):
     return getattr(torch, prec)
 
+def _to_batched(X: torch.Tensor):
+    """Reshape X to 3D (B,ROW,COL).  Returns (X, orig_shape)."""
+    assert X.ndim >= 2
+    X = X.contiguous()
+    orig_shape = X.shape
+    if X.ndim == 2:
+        X = X.unsqueeze(0)
+    elif X.ndim > 3:
+        X = X.view(-1, X.shape[-2], X.shape[-1])
+    return X, orig_shape
+
+
+def _from_batched(result: torch.Tensor, orig_shape: torch.Size):
+    """Reshape result back to orig_shape if needed."""
+    if result.shape != orig_shape:
+        return result.view(orig_shape)
+    return result
+
+
 class NSInt8:
     def __init__(self, autotune: bool = False):
         self.autotune = autotune
@@ -273,8 +292,8 @@ class NSInt8:
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        X = X.contiguous()
-        ROW, COL = X.shape
+        X, orig_shape = _to_batched(X)
+        B, ROW, COL = X.shape
         L = min(ROW, COL)
         H = max(ROW, COL)
         dtype_str = str(X.dtype).split(".")[-1]
@@ -282,27 +301,25 @@ class NSInt8:
         prec = _prec2dtype(precision)
 
         transposed = ROW > COL
-        # Allocate A as (L, H) directly; fused to_prec+transpose avoids the .mT.contiguous() copy
-        A = torch.empty((L, H), device=dev, dtype=prec)
-        R = torch.empty((L, L), device=dev, dtype=prec)
-        Y = torch.empty((L, H), device=dev, dtype=prec)
-        Z = torch.empty((L, L), device=dev, dtype=prec)
-        Q0 = torch.empty((L, L), device=dev, dtype=prec)
-        Q1 = torch.empty((L, L), device=dev, dtype=prec)
+        A = torch.empty((B, L, H), device=dev, dtype=prec)
+        R_mat = torch.empty((B, L, L), device=dev, dtype=prec)
+        Y = torch.empty((B, L, H), device=dev, dtype=prec)
+        Z = torch.empty((B, L, L), device=dev, dtype=prec)
+        Q0 = torch.empty((B, L, L), device=dev, dtype=prec)
+        Q1 = torch.empty((B, L, L), device=dev, dtype=prec)
         if transposed:
-            # Fused: to_prec + transpose out → writes (L, H) directly, no .mT.contiguous()
-            self._to_prec_transpose_out(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+            self._to_prec_transpose_out(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
                           dtype_out=precision, use_norm=True, eps=eps)(
-                X, torch.linalg.vector_norm(X).view(1), A)
+                X, X.norm(dim=[1,2], keepdim=True).view(B), A)
         else:
-            self._to_prec(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+            self._to_prec(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
                           dtype_out=precision, use_norm=True, eps=eps)(
-                X, torch.linalg.vector_norm(X).view(1), A)
+                X, X.norm(dim=[1,2], keepdim=True).view(B), A)
 
         n = len(coeffs)
-        Ksym = dict(M=L, dtype=precision)
-        Knsq = dict(M=L, N=H, K=L, dtype=precision)
-        Kgram = dict(M=L, K=H, dtype=precision)
+        Ksym = dict(B=B, M=L, dtype=precision)
+        Knsq = dict(B=B, M=L, N=H, K=L, dtype=precision)
+        Kgram = dict(B=B, M=L, K=H, dtype=precision)
         
         for t, (a, b, c) in enumerate(coeffs):
             # a*=0.9995; b*=0.9995; c*=0.9995
@@ -312,27 +329,26 @@ class NSInt8:
                 self._ab_prec(**Knsq)(Q0, A, Y)
                 A, Y = Y, A
             if kind == '1' or t == 0:
-                self._aat_prec(**Kgram)(A, R)
-                self._quad_prec(**Ksym)(R, Q0, a, b, c)
+                self._aat_prec(**Kgram)(A, R_mat)
+                self._quad_prec(**Ksym)(R_mat, Q0, a, b, c)
                 if nnr:
-                    self._ab_symm_prec(**Ksym)(R, Q0, Q1)
-                    self._ab_symm_prec(**Ksym)(Q0, Q1, R)
+                    self._ab_symm_prec(**Ksym)(R_mat, Q0, Q1)
+                    self._ab_symm_prec(**Ksym)(Q0, Q1, R_mat)
             else:
-                self._quad_prec(**Ksym)(R, Z, a, b, c)
+                self._quad_prec(**Ksym)(R_mat, Z, a, b, c)
                 self._ab_symm_prec(**Ksym)(Z, Q0, Q1)
                 Q0, Q1 = Q1, Q0
                 if nnr:
-                    self._ab_symm_prec(**Ksym)(R, Z, Q1)
-                    self._ab_symm_prec(**Ksym)(Z, Q1, R)
+                    self._ab_symm_prec(**Ksym)(R_mat, Z, Q1)
+                    self._ab_symm_prec(**Ksym)(Z, Q1, R_mat)
 
         if transposed:
-            # Fused: GEMM + transpose out → writes (H, L) directly, no .mT.contiguous()
-            Y_T = torch.empty((H, L), device=dev, dtype=prec)
+            Y_T = torch.empty((B, H, L), device=dev, dtype=prec)
             self._ab_prec_transpose_out(**Knsq)(Q0, A, Y_T)
-            return Y_T.to(X.dtype)
+            return _from_batched(Y_T, orig_shape).to(X.dtype)
         else:
             self._ab_prec(**Knsq)(Q0, A, Y)
-            return Y.to(X.dtype)
+            return _from_batched(Y, orig_shape).to(X.dtype)
 
     def _gram_bq(
         self,
@@ -359,105 +375,81 @@ class NSInt8:
         deterministic: bool = True,
         precision: str = 'int8'
     ) -> torch.Tensor:
-        r"""Standard Newton-Schulz int8 orthogonalisation.
-
-        Each iteration:  R = X·Xᵀ,  Z = c0·I + c1·R + c2·R²,  X ← Z·X.
-
-        Parameters
-        ----------
-        X : torch.Tensor  shape (M, N), float, cuda
-        coeffs : list of (c0,c1,c2) tuples, optional
-        eps : float
-        deterministic : bool
-
-        Returns
-        -------
-        torch.Tensor  shape (M, N), same dtype as input.
-        """
+        """Standard Newton-Schulz int8.  Accepts (M,N) or (B,M,N)."""
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        assert len(X.shape) == 2
-        X = X.contiguous()
-        ROW, COL = X.shape
+        X, orig_shape = _to_batched(X)
+        B, ROW, COL = X.shape
         dev = X.device
         dtype_str = str(X.dtype).split(".")[-1]
         L = min(ROW, COL)
         H = max(ROW, COL)
 
-        atom = torch.zeros((8, 1), device=dev)
+        atom = torch.zeros((8, B), device=dev)
         A_max = atom[0]
         A_square_sum = atom[1]
         AA_max = atom[2].view(torch.int32)
         B_max = atom[3]
         C_max = atom[4]
         transposed = ROW > COL
-        # Allocate A8 as (L, H) directly; fused scale+transpose avoids the .mT.contiguous() copy
-        A8 = torch.empty((L, H), device=dev, dtype=torch.int8)
-        A_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        AA32L = torch.empty((L, L), device=dev, dtype=torch.int32)
-        AA8 = torch.empty((L, L), device=dev, dtype=torch.int8)
-        AA_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        AA_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-        B32 = torch.empty((L, L), device=dev, dtype=torch.float32)
-        B8 = torch.empty((L, L), device=dev, dtype=torch.int8)
-        B_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        B_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-        C32 = torch.empty((L, H), device=dev, dtype=torch.float32)
+        A8 = torch.empty((B, L, H), device=dev, dtype=torch.int8)
+        A_scale = torch.empty((B,), device=dev, dtype=torch.float32)
+        AA32L = torch.empty((B, L, L), device=dev, dtype=torch.int32)
+        AA8 = torch.empty((B, L, L), device=dev, dtype=torch.int8)
+        AA_scale = torch.empty((B,), device=dev, dtype=torch.float32)
+        AA_diag = torch.empty((B, L), device=dev, dtype=torch.float32)
+        B32 = torch.empty((B, L, L), device=dev, dtype=torch.float32)
+        B8 = torch.empty((B, L, L), device=dev, dtype=torch.int8)
+        B_scale = torch.empty((B,), device=dev, dtype=torch.float32)
+        B_diag = torch.empty((B, L), device=dev, dtype=torch.float32)
+        C32 = torch.empty((B, L, H), device=dev, dtype=torch.float32)
 
         # ── prologue ──
-        self._sumsq_maxabs(M=ROW, N=COL, dtype=dtype_str)(X, A_max, A_square_sum)
+        self._sumsq_maxabs(B=B, M=ROW, N=COL, dtype=dtype_str)(X, A_max, A_square_sum)
+        A_frob_norm = X.norm(dim=[1, 2], keepdim=True).view(B) if deterministic else None
         if transposed:
-            # Fused: scale int8 + transpose out → writes (L, H) directly, no .mT.contiguous()
             if deterministic:
-                A_frob_norm = torch.linalg.vector_norm(X).view(1)
-                self._scale_int8_transpose_out(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                self._scale_int8_transpose_out(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
                          use_norm=True, eps=eps)(X, A_max, A_frob_norm, A8, A_scale)
             else:
-                self._scale_int8_transpose_out(M=ROW, N=COL, dtype=dtype_str)(
-                    X, A_max, A_square_sum, A8, A_scale
-                )
+                self._scale_int8_transpose_out(B=B, M=ROW, N=COL, dtype=dtype_str)(
+                    X, A_max, A_square_sum, A8, A_scale)
         else:
             if deterministic:
-                A_frob_norm = torch.linalg.vector_norm(X).view(1)
-                self._scale_int8(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                self._scale_int8(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
                          use_norm=True, eps=eps)(X, A_max, A_frob_norm, A8, A_scale)
             else:
-                self._scale_int8(M=ROW, N=COL, dtype=dtype_str)(
-                    X, A_max, A_square_sum, A8, A_scale
-                )
+                self._scale_int8(B=B, M=ROW, N=COL, dtype=dtype_str)(
+                    X, A_max, A_square_sum, A8, A_scale)
 
         # ── main loop ──
         N_iter = len(coeffs)
         for i in range(N_iter):
             a, b, c = coeffs[i]
-            self._aat_int8_max(M=L, K=H)(A8, AA32L, AA_max)
-            self._int32_compl_symm_int8(M=L)(
-                AA32L, AA_max, A_scale, AA8, AA_scale, AA_diag
-            )
-            self._typeii_int8_sq(M=L)(
-                AA8, AA_scale, AA_diag, B32, B_max, b, c
-            )
-            self._float32_compl_symm_int8_quad(M=L)(
-                B32, B_max, AA_diag, B8, B_scale, B_diag, a, b, c
-            )
-            self._typeii_typei_int8(M=L, N=H)(
-                B8, B_scale, B_diag, A8, A_scale, C32, C_max
-            )
+            self._aat_int8_max(B=B, M=L, K=H)(A8, AA32L, AA_max)
+            self._int32_compl_symm_int8(B=B, M=L)(
+                AA32L, AA_max, A_scale, AA8, AA_scale, AA_diag)
+            self._typeii_int8_sq(B=B, M=L)(
+                AA8, AA_scale, AA_diag, B32, B_max, b, c)
+            self._float32_compl_symm_int8_quad(B=B, M=L)(
+                B32, B_max, AA_diag, B8, B_scale, B_diag, a, b, c)
+            self._typeii_typei_int8(B=B, M=L, N=H)(
+                B8, B_scale, B_diag, A8, A_scale, C32, C_max)
             if i == N_iter - 1:
                 if transposed:
-                    # Fused: GEMM + transpose out → writes (H, L) directly, no .mT.contiguous()
-                    C32_T = torch.empty((H, L), device=dev, dtype=torch.float32)
-                    self._typeii_typei_int8_transpose_out(M=L, N=H)(
-                        B8, B_scale, B_diag, A8, A_scale, C32_T, C_max
-                    )
-                    return C32_T.to(X.dtype)
+                    C32_T = torch.empty((B, H, L), device=dev, dtype=torch.float32)
+                    self._typeii_typei_int8_transpose_out(B=B, M=L, N=H)(
+                        B8, B_scale, B_diag, A8, A_scale, C32_T, C_max)
+                    result = C32_T.to(X.dtype)
                 else:
-                    return C32.to(X.dtype)
+                    result = C32.to(X.dtype)
+                return _from_batched(result, orig_shape)
             else:
-                self._float32_to_int8(M=L, N=H)(C32, C_max, A8, A_scale)
+                self._float32_to_int8(B=B, M=L, N=H)(C32, C_max, A8, A_scale)
                 atom.zero_()
 
+        raise RuntimeError("unreachable")
         raise RuntimeError("unreachable")
     
     def _regular_prec(
@@ -468,68 +460,48 @@ class NSInt8:
         deterministic: bool = True,
         precision: str = 'float16'
     ) -> torch.Tensor:
-        r"""Standard Newton-Schulz fp16 orthogonalisation.
-
-        Each iteration:  R = X·Xᵀ,  Z = c0·I + c1·R + c2·R²,  X ← Z·X.
-
-        Parameters
-        ----------
-        X : torch.Tensor  shape (M, N), float, cuda
-        coeffs : list of (c0,c1,c2) tuples, optional
-        eps : float
-        deterministic : bool
-
-        Returns
-        -------
-        torch.Tensor  shape (M, N), same dtype as input.
-        """
+        """Standard Newton-Schulz fp16.  Accepts (M,N) or (B,M,N)."""
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        assert len(X.shape) == 2
-        X = X.contiguous()
-        ROW, COL = X.shape
+        X, orig_shape = _to_batched(X)
+        B, ROW, COL = X.shape
         dev = X.device
         dtype_str = str(X.dtype).split(".")[-1]
         L = min(ROW, COL)
         H = max(ROW, COL)
 
         transposed = ROW > COL
-        # Allocate A as (L, H) directly; fused to_prec+transpose avoids the .mT.contiguous() copy
-        A = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
-        B = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        C = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
-        AA = torch.as_strided(C, (L, L), (L, 1))
-        AAA = torch.as_strided(A, (L, L), (L, 1))
+        A = torch.empty((B, L, H), device=dev, dtype=_prec2dtype(precision))
+        B_mat = torch.empty((B, L, L), device=dev, dtype=_prec2dtype(precision))
+        C = torch.empty((B, L, H), device=dev, dtype=_prec2dtype(precision))
+        AA = torch.as_strided(C, (B, L, L), (L * L, L, 1))
+        AAA = torch.as_strided(A, (B, L, L), (L * L, L, 1))
 
-        A_frob_norm = torch.linalg.vector_norm(X).view(1)
+        A_frob_norm = X.norm(dim=[1, 2], keepdim=True).view(B)
         if transposed:
-            # Fused: to_prec + transpose out → writes (L, H) directly, no .mT.contiguous()
-            self._to_prec_transpose_out(
-                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
-            )(X, A_frob_norm, A)
+            self._to_prec_transpose_out(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                dtype_out=precision, use_norm=True, eps=eps)(X, A_frob_norm, A)
         else:
-            self._to_prec(
-                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
-            )(X, A_frob_norm, A)
+            self._to_prec(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                dtype_out=precision, use_norm=True, eps=eps)(X, A_frob_norm, A)
 
-        # ── main loop ──
         N_iter = len(coeffs)
         for i in range(N_iter):
             a, b, c = coeffs[i]
-            self._aat_prec(M=L, K=H, dtype=precision)(A, AA)
-            self._quad_prec(M=L, dtype=precision)(AA, B, a, b, c)
+            self._aat_prec(B=B, M=L, K=H, dtype=precision)(A, AA)
+            self._quad_prec(B=B, M=L, dtype=precision)(AA, B_mat, a, b, c)
             if i == N_iter - 1:
                 if transposed:
-                    # Fused: GEMM + transpose out → writes (H, L) directly, no .mT.contiguous()
-                    C_T = torch.empty((H, L), device=dev, dtype=_prec2dtype(precision))
-                    self._ab_prec_transpose_out(M=L, K=L, N=H, dtype=precision)(B, A, C_T)
-                    return C_T.to(X.dtype)
+                    C_T = torch.empty((B, H, L), device=dev, dtype=_prec2dtype(precision))
+                    self._ab_prec_transpose_out(B=B, M=L, K=L, N=H, dtype=precision)(B_mat, A, C_T)
+                    result = C_T.to(X.dtype)
                 else:
-                    self._ab_prec(M=L, K=L, N=H, dtype=precision)(B, A, C)
-                    return C.to(X.dtype)
+                    self._ab_prec(B=B, M=L, K=L, N=H, dtype=precision)(B_mat, A, C)
+                    result = C.to(X.dtype)
+                return _from_batched(result, orig_shape)
             else:
-                self._ab_prec(M=L, K=L, N=H, dtype=precision)(B, A, C)
+                self._ab_prec(B=B, M=L, K=L, N=H, dtype=precision)(B_mat, A, C)
                 A, C = C, A
                 AA, AAA = AAA, AA
         raise RuntimeError("unreachable")
@@ -546,9 +518,8 @@ class NSInt8:
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        assert len(X.shape) == 2
-        X = X.contiguous()
-        ROW, COL = X.shape
+        X, orig_shape = _to_batched(X)
+        B, ROW, COL = X.shape
         dev = X.device
         dtype_str = str(X.dtype).split(".")[-1]
         L = min(ROW, COL)
@@ -557,57 +528,50 @@ class NSInt8:
         HQ = _cdiv(H, BLOCK_Q)
         
         transposed = ROW > COL
-        # Allocate A and A_scale directly in (L,H)/(LQ,HQ) shape
-        A = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
-        A_scale = torch.empty((LQ, HQ), device=dev, dtype=torch.float32)
+        A = torch.empty((B, L, H), device=dev, dtype=_prec2dtype(precision))
+        A_scale = torch.empty((B, LQ, HQ), device=dev, dtype=torch.float32)
 
-        B = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        B_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
-        B_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+        B_mat = torch.empty((B, L, L), device=dev, dtype=_prec2dtype(precision))
+        B_scale = torch.empty((B, LQ, LQ), device=dev, dtype=torch.float32)
+        B_diag = torch.empty((B, L), device=dev, dtype=torch.float32)
         
-        C = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
-        C_scale = torch.empty((LQ, HQ), device=dev, dtype=torch.float32)
+        C = torch.empty((B, L, H), device=dev, dtype=_prec2dtype(precision))
+        C_scale = torch.empty((B, LQ, HQ), device=dev, dtype=torch.float32)
 
-        AA = torch.as_strided(C, (L, L), (L, 1))
-        AA_scale = torch.as_strided(C_scale, (LQ, LQ), (LQ, 1))
-        AA_diag = torch.empty((L,), device=dev, dtype=torch.float32)
+        AA = torch.as_strided(C, (B, L, L), (L * L, L, 1))
+        AA_scale = torch.as_strided(C_scale, (B, LQ, LQ), (LQ * LQ, LQ, 1))
+        AA_diag = torch.empty((B, L), device=dev, dtype=torch.float32)
         
-        AAA = torch.as_strided(A, (L, L), (L, 1))
-        AAA_scale = torch.as_strided(A_scale, (LQ, LQ), (LQ, 1))
+        AAA = torch.as_strided(A, (B, L, L), (L * L, L, 1))
+        AAA_scale = torch.as_strided(A_scale, (B, LQ, LQ), (LQ * LQ, LQ, 1))
 
-        A_frob_norm = torch.linalg.vector_norm(X).view(1)
+        A_frob_norm = X.norm(dim=[1, 2], keepdim=True).view(B)
         if transposed:
-            # Fused: to_bq + transpose out → writes (L, H) directly
-            self._to_bq_transpose_out(
-                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
-            )(X, A_frob_norm, A, A_scale)
+            self._to_bq_transpose_out(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                dtype_out=precision, use_norm=True, eps=eps)(X, A_frob_norm, A, A_scale)
         else:
-            self._to_bq(
-                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
-            )(X, A_frob_norm, A, A_scale)
+            self._to_bq(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                dtype_out=precision, use_norm=True, eps=eps)(X, A_frob_norm, A, A_scale)
 
-        # ── main loop ──
         N_iter = len(coeffs)
         for i in range(N_iter):
             a, b, c = coeffs[i]
-            self._aat_bq(M=L, K=H, dtype=precision)(A, A_scale, AA, AA_scale, AA_diag)
-            self._quad_bq(M=L, dtype=precision)(AA, AA_scale, AA_diag, B, B_scale, B_diag, a, b, c)
+            self._aat_bq(B=B, M=L, K=H, dtype=precision)(A, A_scale, AA, AA_scale, AA_diag)
+            self._quad_bq(B=B, M=L, dtype=precision)(AA, AA_scale, AA_diag, B_mat, B_scale, B_diag, a, b, c)
             if i == N_iter - 1:
                 if transposed:
-                    # Fused: final GEMM + transpose out → writes (H, L) directly
-                    Z_T = torch.empty((H, L), device=dev, dtype=torch.float32)
-                    self._typeii_typei_final_bq_transpose_out(M=L, N=H, dtype=precision)(
-                        B, B_scale, B_diag, A, A_scale, Z_T
-                    )
-                    return Z_T.to(X.dtype)
+                    Z_T = torch.empty((B, H, L), device=dev, dtype=torch.float32)
+                    self._typeii_typei_final_bq_transpose_out(B=B, M=L, N=H, dtype=precision)(
+                        B_mat, B_scale, B_diag, A, A_scale, Z_T)
+                    result = Z_T.to(X.dtype)
                 else:
-                    Z = torch.empty((L, H), device=dev, dtype=torch.float32)
-                    self._typeii_typei_final_bq(M=L, N=H, dtype=precision)(
-                        B, B_scale, B_diag, A, A_scale, Z
-                    )
-                    return Z.to(X.dtype)
+                    Z = torch.empty((B, L, H), device=dev, dtype=torch.float32)
+                    self._typeii_typei_final_bq(B=B, M=L, N=H, dtype=precision)(
+                        B_mat, B_scale, B_diag, A, A_scale, Z)
+                    result = Z.to(X.dtype)
+                return _from_batched(result, orig_shape)
             else:
-                self._typeii_typei_bq(M=L, N=H, dtype=precision)(B, B_scale, B_diag, A, A_scale, C, C_scale)
+                self._typeii_typei_bq(B=B, M=L, N=H, dtype=precision)(B_mat, B_scale, B_diag, A, A_scale, C, C_scale)
                 A, A_scale, C, C_scale = C, C_scale, A, A_scale
                 AA, AA_scale, AAA, AAA_scale, = AAA, AAA_scale, AA, AA_scale
 

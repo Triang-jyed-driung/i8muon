@@ -25,7 +25,7 @@ def _adjust_lr(lr: float, adjust_lr_fn, param_shape: torch.Size) -> float:
     If ``adjust_lr_fn`` is callable: ``fn(lr, A, B) -> float``.
     Built-in strings: ``"spectral"`` (default), ``"original"``, ``"match_rms_adamw"``.
     """
-    A, B = param_shape[:2]
+    A, B = param_shape[-2], param_shape[-1]
 
     if callable(adjust_lr_fn):
         return adjust_lr_fn(lr, A, B) # type: ignore
@@ -367,14 +367,14 @@ def _single_tensor_muon(
 
     for i, param in enumerate(params):
         grad = grads[i]
-        if grad.ndim != 2:
+        if grad.ndim < 2:
             raise ValueError("Param gradient must be a 2D matrix")
 
         buf = momentum_bufs[i]
         buf.lerp_(grad, 1 - mu2)
         update = grad.lerp(buf, mu) if nesterov else buf
 
-        M, N = update.shape
+        M, N = update.shape[-2], update.shape[-1]
         
         ns_fn, actual_prec = ns_engine.router(M, N, precision, use_gram, gram_aspect_threshold)
         def call_ns(u):
