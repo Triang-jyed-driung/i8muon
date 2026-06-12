@@ -1,4 +1,3 @@
-
 import os
 import itertools
 import warnings
@@ -9,6 +8,8 @@ from ._kernels import *
 from functools import cache, lru_cache
 
 DISABLE_TMA = not int(os.environ.get("I8MUON_USE_TMA", '1'))
+GRAM_ORDER = os.environ.get("I8MUON_GRAM_RESET", '00100')
+
 # warnings.warn(f"I8MUON: disable TMA and warp specialization: {DISABLE_TMA}")
 if not DISABLE_TMA:
     warnings.warn(
@@ -190,6 +191,7 @@ tune_mem_blockq = tilelang.autotune(
 kernel_map = [
     (_sumsq_maxabs, tune_mem),
     (_scale_int8, tune_mem),
+    (_scale_int8_transpose_out, tune_mem),
     (_aat_int8_max, tune_gemm_packed),
     (_int32_compl_symm_int8, tune_mem_packed),
     (_typeii_int8_sq, tune_gemm_packed),
@@ -197,17 +199,22 @@ kernel_map = [
     (_typeii_int8_ab, tune_gemm_packed),
     (_float32_ab_to_int8, tune_mem_packed),
     (_typeii_typei_int8, tune_gemm),
+    (_typeii_typei_int8_transpose_out, tune_gemm),
     (_float32_to_int8, tune_mem),
     (_to_prec, tune_mem),
+    (_to_prec_transpose_out, tune_mem),
     (_ab_prec, tune_gemm_prec),
+    (_ab_prec_transpose_out, tune_gemm_prec),
     (_aat_prec, tune_gemm_packed_prec),
     (_quad_prec, tune_gemm_packed_prec),
     (_ab_symm_prec, tune_gemm_packed_prec),
     (_to_bq, tune_mem_blockq),
+    (_to_bq_transpose_out, tune_mem_blockq),
     (_aat_bq, tune_gemm_blockq),
     (_quad_bq, tune_gemm_blockq),
     (_typeii_typei_bq, tune_gemm_blockq),
     (_typeii_typei_final_bq, tune_gemm_blockq),
+    (_typeii_typei_final_bq_transpose_out, tune_gemm_blockq),
     (_ab_symm_bq, tune_gemm_blockq),
 ]
 
@@ -251,150 +258,8 @@ class NSInt8:
         precision: str = 'int8'
     ) -> torch.Tensor:
         r"""Gram-form int8 Newton-Schulz orthogonalisation."""
-        if coeffs is None:
-            coeffs = _DEFAULT_NS_COEFFS
-        
-        warnings.warn("Int8 Gram Newton-Schulz is not precise enough yet. Use at your own risk.")
 
-        X = X.contiguous()
-        ROW, COL = X.shape
-        L = min(ROW, COL)
-        H = max(ROW, COL)
-        dtype_str = str(X.dtype).split(".")[-1]
-        dev = X.device
-
-        # ── pre-allocate ──
-        A8 = torch.empty((ROW, COL), device=dev, dtype=torch.int8)
-        A_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        atom = torch.zeros((8, 1), device=dev)
-        A_max = atom[0]
-        A_square_sum = atom[1]
-        AA_max = atom[2].view(torch.int32)
-        B_max = atom[3]
-        C_max = atom[4]
-        B_max_1 = atom[5]
-        B_max_2 = atom[6]
-        B_max_3 = atom[7]
-        AA32L = torch.empty((L, L), device=dev, dtype=torch.int32)
-        R8 = torch.empty((L, L), device=dev, dtype=torch.int8)
-        R_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        R_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-        B32 = torch.empty((L, L), device=dev, dtype=torch.float32)
-        Z8 = torch.empty((L, L), device=dev, dtype=torch.int8)
-        Z_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        Z_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-        Q8 = torch.empty((L, L), device=dev, dtype=torch.int8)
-        Q_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        Q_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-        RZ8 = torch.empty((L, L), device=dev, dtype=torch.int8)
-        RZ_scale = torch.empty((1,), device=dev, dtype=torch.float32)
-        RZ_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-        C32 = torch.empty((L, H), device=dev, dtype=torch.float32)
-
-        # ── Step 1: Frobenius norm + int8 quantise ──
-        self._sumsq_maxabs(M=ROW, N=COL, dtype=dtype_str)(X, A_max, A_square_sum)
-        if deterministic:
-            A_frob_norm = torch.linalg.vector_norm(X).view(1)
-            self._scale_int8(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
-                     use_norm=True, eps=eps)(X, A_max, A_frob_norm, A8, A_scale)
-        else:
-            self._scale_int8(M=ROW, N=COL, dtype=dtype_str)(
-                X, A_max, A_square_sum, A8, A_scale
-            )
-
-        # ── Step 2: Transpose trick: make it L×H with L = min ──
-        transposed = ROW > COL
-        if transposed:
-            A8 = A8.mT.contiguous()
-
-        # ── Step 3: R = A @ A^T (Gram matrix in Type2) ──
-        self._aat_int8_max(M=L, K=H)(A8, AA32L, AA_max)
-        self._int32_compl_symm_int8(M=L)(
-            AA32L, AA_max, A_scale, R8, R_scale, R_diag
-        )
-
-        # ── Step 4: unrolled iterations ──
-        #  kind: "i"(init t=0), "r"(restart), "n"(normal), "e"(end)
-        #  init/restart: Q = Z,  then RZ = R·Q,  R = Q·RZ
-        #  normal/end:   Z → Z8,  Q = Q·Z,  (normal only) RZ = R·Z, R = Z·RZ
-        for t in range(len(coeffs)):
-            a, b, c = coeffs[t]
-            a *= 0.997
-            b *= 0.997
-            c *= 0.997
-            kind = ("i" if t == 0
-                    else "e" if t == len(coeffs) - 1
-                    else "r" if (t + len(coeffs)) % 2 == 0
-                    else "n")
-
-            if kind == "r":
-                atom.zero_()
-                # X = Q @ X  (Type2 × Type1)
-                self._typeii_typei_int8(M=L, N=H)(
-                    Q8, Q_scale, Q_diag, A8, A_scale, C32, C_max
-                )
-                self._float32_to_int8(M=L, N=H)(C32, C_max, A8, A_scale)
-                # R = X @ X^T  (recompute Gram)
-                self._aat_int8_max(M=L, K=H)(A8, AA32L, AA_max)
-                self._int32_compl_symm_int8(M=L)(
-                    AA32L, AA_max, A_scale, R8, R_scale, R_diag
-                )
-
-            if kind in ("i", "r"):
-                self._typeii_int8_sq(M=L)(
-                    R8, R_scale, R_diag, B32, B_max, b, c
-                )
-                self._float32_compl_symm_int8_quad(M=L)(
-                    B32, B_max, R_diag, Q8, Q_scale, Q_diag, a, b, c
-                )
-                # RZ = R @ Q  (Q holds Z)
-                self._typeii_int8_ab(M=L)(
-                    R8, R_scale, R_diag, Q8, Q_scale, Q_diag, B32, B_max_1
-                )
-                self._float32_ab_to_int8(M=L)(B32, B_max_1, RZ8, RZ_scale, RZ_diag)
-                # R = Q @ RZ
-                self._typeii_int8_ab(M=L)(
-                    Q8, Q_scale, Q_diag, RZ8, RZ_scale, RZ_diag, B32, B_max_2
-                )
-                self._float32_ab_to_int8(M=L)(B32, B_max_2, R8, R_scale, R_diag)
-            else:  # "n" or "e"
-                atom.zero_()
-                self._typeii_int8_sq(M=L)(
-                    R8, R_scale, R_diag, B32, B_max, b, c
-                )
-                self._float32_compl_symm_int8_quad(M=L)(
-                    B32, B_max, R_diag, Z8, Z_scale, Z_diag, a, b, c
-                )
-                # Q = Q @ Z  (Type2 × Type2)
-                self._typeii_int8_ab(M=L)(
-                    Z8, Z_scale, Z_diag, Q8, Q_scale, Q_diag, B32, B_max_1
-                )
-                self._float32_ab_to_int8(M=L)(B32, B_max_1, Q8, Q_scale, Q_diag)
-                if kind == "n":
-                    # RZ = R @ Z
-                    self._typeii_int8_ab(M=L)(
-                        R8, R_scale, R_diag,
-                        Z8, Z_scale, Z_diag, B32, B_max_2,
-                    )
-                    self._float32_ab_to_int8(M=L)(B32, B_max_2, RZ8, RZ_scale, RZ_diag)
-                    # R = Z @ RZ
-                    self._typeii_int8_ab(M=L)(
-                        Z8, Z_scale, Z_diag,
-                        RZ8, RZ_scale, RZ_diag, B32, B_max_3,
-                    )
-                    self._float32_ab_to_int8(M=L)(B32, B_max_3, R8, R_scale, R_diag)
-
-        # ── Step 5: X_out = Q_final @ X ──
-        self._typeii_typei_int8(M=L, N=H)(
-            Q8, Q_scale, Q_diag, A8, A_scale, C32, C_max
-        )
-        X_out = C32.to(X.dtype)
-
-        # Undo transpose trick
-        if transposed:
-            X_out = X_out.mT.contiguous()
-
-        return X_out
+        raise RuntimeError("Int8 Gram Newton-Schulz is not precise enough. Temporarily disabled.")
 
     def _gram_prec(
         self,
@@ -414,82 +279,60 @@ class NSInt8:
         H = max(ROW, COL)
         dtype_str = str(X.dtype).split(".")[-1]
         dev = X.device
+        prec = _prec2dtype(precision)
 
-        # ── pre-allocate ──
-        A = torch.empty((ROW, COL), device=dev, dtype=_prec2dtype(precision))
-        R = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        Y = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
-        QQ = torch.as_strided(Y, (L, L), (L, 1))
-        # QQ = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        Z = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        Q = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        # RZ = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-
-        # ── Step 1: Frobenius norm + int8 quantise ──
-        # self._sumsq_maxabs(M=ROW, N=COL, dtype=dtype_str)(X, A_max, A_square_sum)
-        A_frob_norm = torch.linalg.vector_norm(X).view(1)
-        self._to_prec(
-            M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps,
-        )(X, A_frob_norm, A)
-
-        # ── Step 2: Transpose trick: make it L×H with L = min ──
         transposed = ROW > COL
+        # Allocate A as (L, H) directly; fused to_prec+transpose avoids the .mT.contiguous() copy
+        A = torch.empty((L, H), device=dev, dtype=prec)
+        R = torch.empty((L, L), device=dev, dtype=prec)
+        Y = torch.empty((L, H), device=dev, dtype=prec)
+        Z = torch.empty((L, L), device=dev, dtype=prec)
+        Q0 = torch.empty((L, L), device=dev, dtype=prec)
+        Q1 = torch.empty((L, L), device=dev, dtype=prec)
         if transposed:
-            A = A.mT.contiguous()
-        QQA = torch.as_strided(A, (L, L), (L, 1))
+            # Fused: to_prec + transpose out → writes (L, H) directly, no .mT.contiguous()
+            self._to_prec_transpose_out(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                          dtype_out=precision, use_norm=True, eps=eps)(
+                X, torch.linalg.vector_norm(X).view(1), A)
+        else:
+            self._to_prec(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                          dtype_out=precision, use_norm=True, eps=eps)(
+                X, torch.linalg.vector_norm(X).view(1), A)
 
-        # ── Step 3: R = A @ A^T (Gram matrix in Type2) ──
-        self._aat_prec(M=L, K=H, dtype=precision)(A, R)
+        n = len(coeffs)
+        Ksym = dict(M=L, dtype=precision)
+        Knsq = dict(M=L, N=H, K=L, dtype=precision)
+        Kgram = dict(M=L, K=H, dtype=precision)
+        
+        for t, (a, b, c) in enumerate(coeffs):
+            # a*=0.9995; b*=0.9995; c*=0.9995
+            kind = GRAM_ORDER[t]
+            nnr = t + 1 < n and GRAM_ORDER[t+1] == '0'
+            if kind == '1':
+                self._ab_prec(**Knsq)(Q0, A, Y)
+                A, Y = Y, A
+            if kind == '1' or t == 0:
+                self._aat_prec(**Kgram)(A, R)
+                self._quad_prec(**Ksym)(R, Q0, a, b, c)
+                if nnr:
+                    self._ab_symm_prec(**Ksym)(R, Q0, Q1)
+                    self._ab_symm_prec(**Ksym)(Q0, Q1, R)
+            else:
+                self._quad_prec(**Ksym)(R, Z, a, b, c)
+                self._ab_symm_prec(**Ksym)(Z, Q0, Q1)
+                Q0, Q1 = Q1, Q0
+                if nnr:
+                    self._ab_symm_prec(**Ksym)(R, Z, Q1)
+                    self._ab_symm_prec(**Ksym)(Z, Q1, R)
 
-        # ── Step 4: unrolled iterations ──
-        #  kind: "i"(init t=0), "r"(restart), "n"(normal), "e"(end)
-        for t in range(len(coeffs)):
-            a, b, c = coeffs[t]
-            a *= 0.997
-            b *= 0.997
-            c *= 0.997
-            kind = ("i" if t == 0
-                    else "e" if t == len(coeffs) - 1
-                    else "r" if (t + len(coeffs)) % 2 == 0
-                    else "n")
-
-            if kind == "r":
-                # Y = Q @ X
-                self._ab_prec(M=L, N=H, K=L, dtype=precision)(Q, A, Y)
-                # R = Y @ Y^T  (recompute Gram)
-                self._aat_prec(M=L, K=H, dtype=precision)(Y, R)
-                
-                A, Y = Y, A 
-                QQ, QQA = QQA, QQ
-
-            if kind in ("i", "r"):
-                # Q = Quad(R)
-                self._quad_prec(M=L, dtype=precision)(R, Q, a, b, c)
-                # RZ = R @ Q  (Q holds Z)
-                self._ab_symm_prec(M=L, dtype=precision)(R, Q, QQ)
-                # R = Q @ RZ
-                self._ab_symm_prec(M=L, dtype=precision)(Q, QQ, R)
-            else:  # "n" or "e"
-                # Z = Quad(R)
-                self._quad_prec(M=L, dtype=precision)(R, Z, a, b, c)
-                # Q = Z @ Q 
-                self._ab_symm_prec(M=L, dtype=precision)(Z, Q, QQ)
-                Q.copy_(QQ)
-                if kind == "n":
-                    # RZ = R @ Z
-                    self._ab_symm_prec(M=L, dtype=precision)(R, Z, QQ)
-                    # R = Z @ RZ
-                    self._ab_symm_prec(M=L, dtype=precision)(Z, QQ, R)
-
-        # ── Step 5: X_out = Q_final @ X ──
-        self._ab_prec(M=L, N=H, K=L, dtype=precision)(Q, A, Y)
         if transposed:
-            Y = Y.mT.contiguous()
-        X_out = Y.to(X.dtype)
-
-        return X_out
-    
-
+            # Fused: GEMM + transpose out → writes (H, L) directly, no .mT.contiguous()
+            Y_T = torch.empty((H, L), device=dev, dtype=prec)
+            self._ab_prec_transpose_out(**Knsq)(Q0, A, Y_T)
+            return Y_T.to(X.dtype)
+        else:
+            self._ab_prec(**Knsq)(Q0, A, Y)
+            return Y.to(X.dtype)
 
     def _gram_bq(
         self,
@@ -500,109 +343,9 @@ class NSInt8:
         precision: str = 'float16'
     ) -> torch.Tensor:
         r"""Gram-form fp16 Newton-Schulz orthogonalisation."""
-        if coeffs is None:
-            coeffs = _DEFAULT_NS_COEFFS
 
-        X = X.contiguous()
-        ROW, COL = X.shape
-        L = min(ROW, COL)
-        H = max(ROW, COL)
-        LQ = _cdiv(L, BLOCK_Q)
-        HQ = _cdiv(H, BLOCK_Q)
-        dtype_str = str(X.dtype).split(".")[-1]
-        dev = X.device
+        raise RuntimeError("Block quantized Gram Newton-Schulz is not precise enough. Temporarily disabled.")
 
-        # ── pre-allocate ──
-        A = torch.empty((ROW, COL), device=dev, dtype=_prec2dtype(precision))
-        A_scale = torch.empty((_cdiv(ROW, BLOCK_Q), _cdiv(COL, BLOCK_Q)), device=dev, dtype=torch.float32)
-
-        R = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        R_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
-        R_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-
-        Y = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
-        Y_scale = torch.empty((LQ, HQ), device=dev, dtype=torch.float32)
-
-        QQ = torch.as_strided(Y, (L, L), (L, 1))
-        QQ_scale = torch.as_strided(Y_scale, (LQ, LQ), (LQ, 1))
-        QQ_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-
-
-        # QQ = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        Z = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        Z_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
-        Z_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-
-        Q = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
-        Q_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
-        Q_diag = torch.empty((L,), device=dev, dtype=torch.float32)
-
-        O = torch.empty((L, H), device=dev, dtype=torch.float32)
-        # ── Step 1: Frobenius norm + int8 quantise ──
-        # self._sumsq_maxabs(M=ROW, N=COL, dtype=dtype_str)(X, A_max, A_square_sum)
-        A_frob_norm = torch.linalg.vector_norm(X).view(1)
-        self._to_bq(
-            M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps,
-        )(X, A_frob_norm, A, A_scale)
-
-        # ── Step 2: Transpose trick: make it L×H with L = min ──
-        transposed = ROW > COL
-        if transposed:
-            A = A.mT.contiguous()
-            A_scale = A_scale.mT.contiguous()
-        
-        QQA = torch.as_strided(A, (L, L), (L, 1))
-        QQA_scale = torch.as_strided(A_scale, (LQ, LQ), (LQ, 1))
-
-        # ── Step 3: R = A @ A^T (Gram matrix in Type2) ──
-        self._aat_bq(M=L, K=H, dtype=precision)(A, A_scale, R, R_scale, R_diag)
-
-        # ── Step 4: unrolled iterations ──
-        #  kind: "i"(init t=0), "r"(restart), "n"(normal), "e"(end)
-        for t in range(len(coeffs)):
-            a, b, c = coeffs[t]
-            a *= 0.997
-            b *= 0.997
-            c *= 0.997
-            kind = ("i" if t == 0
-                    else "e" if t == len(coeffs) - 1
-                    else "r" if (t + len(coeffs)) % 2 == 0
-                    else "n")
-
-            if kind == "r":
-                # Y = Q @ X
-                self._typeii_typei_bq(M=L, N=H, dtype=precision)(Q, Q_scale, Q_diag, A, A_scale, Y, Y_scale)
-                # R = Y @ Y^T  (recompute Gram)
-                self._aat_bq(M=L, K=H, dtype=precision)(Y, Y_scale, R, R_scale, R_diag)
-                
-                A, A_scale, Y, Y_scale = Y, Y_scale, A, A_scale
-                QQ, QQ_scale, QQA, QQA_scale = QQA, QQA_scale, QQ, QQ_scale
-
-            if kind in ("i", "r"):
-                # Q = Quad(R)
-                self._quad_bq(M=L, dtype=precision)(R, R_scale, R_diag, Q, Q_scale, Q_diag, a, b, c)
-                # RZ = R @ Q  (Q holds Z)
-                self._ab_symm_bq(M=L, dtype=precision)(R, R_scale, R_diag, Q, Q_scale, Q_diag, QQ, QQ_scale, QQ_diag)
-                # R = Q @ RZ
-                self._ab_symm_bq(M=L, dtype=precision)(Q, Q_scale, Q_diag, QQ, QQ_scale, QQ_diag, R, R_scale, R_diag)
-            else:  # "n" or "e"
-                # Z = Quad(R)
-                self._quad_bq(M=L, dtype=precision)(R, R_scale, R_diag, Z, Z_scale, Z_diag, a, b, c)
-                # Q = Z @ Q 
-                self._ab_symm_bq(M=L, dtype=precision)(Z, Z_scale, Z_diag, Q, Q_scale, Q_diag, QQ, QQ_scale, QQ_diag)
-                torch._foreach_copy_((Q, Q_scale, Q_diag), (QQ, QQ_scale, QQ_diag))
-                if kind == "n":
-                    # RZ = R @ Z
-                    self._ab_symm_bq(M=L, dtype=precision)(R, R_scale, R_diag, Z, Z_scale, Z_diag, QQ, QQ_scale, QQ_diag)
-                    # R = Z @ RZ
-                    self._ab_symm_bq(M=L, dtype=precision)(Z, Z_scale, Z_diag, QQ, QQ_scale, QQ_diag, R, R_scale, R_diag)
-
-        # ── Step 5: X_out = Q_final @ X ──
-        self._typeii_typei_final_bq(M=L, N=H, dtype=precision)(Q, Q_scale, Q_diag, A, A_scale, O)
-        OO = O.to(X.dtype)
-        if transposed:
-            OO = OO.mT.contiguous()
-        return OO
     # ═══════════════════════════════════════════════════════════════
     #  Public:  regular  (standard Newton-Schulz)
     # ═══════════════════════════════════════════════════════════════
@@ -648,7 +391,9 @@ class NSInt8:
         AA_max = atom[2].view(torch.int32)
         B_max = atom[3]
         C_max = atom[4]
-        A8 = torch.empty((ROW, COL), device=dev, dtype=torch.int8)
+        transposed = ROW > COL
+        # Allocate A8 as (L, H) directly; fused scale+transpose avoids the .mT.contiguous() copy
+        A8 = torch.empty((L, H), device=dev, dtype=torch.int8)
         A_scale = torch.empty((1,), device=dev, dtype=torch.float32)
         AA32L = torch.empty((L, L), device=dev, dtype=torch.int32)
         AA8 = torch.empty((L, L), device=dev, dtype=torch.int8)
@@ -662,18 +407,25 @@ class NSInt8:
 
         # ── prologue ──
         self._sumsq_maxabs(M=ROW, N=COL, dtype=dtype_str)(X, A_max, A_square_sum)
-        if deterministic:
-            A_frob_norm = torch.linalg.vector_norm(X).view(1)
-            self._scale_int8(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
-                     use_norm=True, eps=eps)(X, A_max, A_frob_norm, A8, A_scale)
-        else:
-            self._scale_int8(M=ROW, N=COL, dtype=dtype_str)(
-                X, A_max, A_square_sum, A8, A_scale
-            )
-
-        transposed = ROW > COL
         if transposed:
-            A8 = A8.mT.contiguous()
+            # Fused: scale int8 + transpose out → writes (L, H) directly, no .mT.contiguous()
+            if deterministic:
+                A_frob_norm = torch.linalg.vector_norm(X).view(1)
+                self._scale_int8_transpose_out(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                         use_norm=True, eps=eps)(X, A_max, A_frob_norm, A8, A_scale)
+            else:
+                self._scale_int8_transpose_out(M=ROW, N=COL, dtype=dtype_str)(
+                    X, A_max, A_square_sum, A8, A_scale
+                )
+        else:
+            if deterministic:
+                A_frob_norm = torch.linalg.vector_norm(X).view(1)
+                self._scale_int8(M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
+                         use_norm=True, eps=eps)(X, A_max, A_frob_norm, A8, A_scale)
+            else:
+                self._scale_int8(M=ROW, N=COL, dtype=dtype_str)(
+                    X, A_max, A_square_sum, A8, A_scale
+                )
 
         # ── main loop ──
         N_iter = len(coeffs)
@@ -693,10 +445,15 @@ class NSInt8:
                 B8, B_scale, B_diag, A8, A_scale, C32, C_max
             )
             if i == N_iter - 1:
-                C = C32.to(X.dtype)
                 if transposed:
-                    C = C.mT.contiguous()
-                return C
+                    # Fused: GEMM + transpose out → writes (H, L) directly, no .mT.contiguous()
+                    C32_T = torch.empty((H, L), device=dev, dtype=torch.float32)
+                    self._typeii_typei_int8_transpose_out(M=L, N=H)(
+                        B8, B_scale, B_diag, A8, A_scale, C32_T, C_max
+                    )
+                    return C32_T.to(X.dtype)
+                else:
+                    return C32.to(X.dtype)
             else:
                 self._float32_to_int8(M=L, N=H)(C32, C_max, A8, A_scale)
                 atom.zero_()
@@ -737,20 +494,24 @@ class NSInt8:
         L = min(ROW, COL)
         H = max(ROW, COL)
 
-        A = torch.empty((ROW, COL), device=dev, dtype=_prec2dtype(precision))
+        transposed = ROW > COL
+        # Allocate A as (L, H) directly; fused to_prec+transpose avoids the .mT.contiguous() copy
+        A = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
         B = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
         C = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
         AA = torch.as_strided(C, (L, L), (L, 1))
         AAA = torch.as_strided(A, (L, L), (L, 1))
 
         A_frob_norm = torch.linalg.vector_norm(X).view(1)
-        self._to_prec(
-            M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
-        )(X, A_frob_norm, A)
-
-        transposed = ROW > COL
         if transposed:
-            A = A.mT.contiguous()
+            # Fused: to_prec + transpose out → writes (L, H) directly, no .mT.contiguous()
+            self._to_prec_transpose_out(
+                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
+            )(X, A_frob_norm, A)
+        else:
+            self._to_prec(
+                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
+            )(X, A_frob_norm, A)
 
         # ── main loop ──
         N_iter = len(coeffs)
@@ -758,12 +519,17 @@ class NSInt8:
             a, b, c = coeffs[i]
             self._aat_prec(M=L, K=H, dtype=precision)(A, AA)
             self._quad_prec(M=L, dtype=precision)(AA, B, a, b, c)
-            self._ab_prec(M=L, K=L, N=H, dtype=precision)(B, A, C)
             if i == N_iter - 1:
                 if transposed:
-                    C = C.mT.contiguous()
-                return C.to(X.dtype)
+                    # Fused: GEMM + transpose out → writes (H, L) directly, no .mT.contiguous()
+                    C_T = torch.empty((H, L), device=dev, dtype=_prec2dtype(precision))
+                    self._ab_prec_transpose_out(M=L, K=L, N=H, dtype=precision)(B, A, C_T)
+                    return C_T.to(X.dtype)
+                else:
+                    self._ab_prec(M=L, K=L, N=H, dtype=precision)(B, A, C)
+                    return C.to(X.dtype)
             else:
+                self._ab_prec(M=L, K=L, N=H, dtype=precision)(B, A, C)
                 A, C = C, A
                 AA, AAA = AAA, AA
         raise RuntimeError("unreachable")
@@ -790,8 +556,10 @@ class NSInt8:
         LQ = _cdiv(L, BLOCK_Q)
         HQ = _cdiv(H, BLOCK_Q)
         
-        A = torch.empty((ROW, COL), device=dev, dtype=_prec2dtype(precision))
-        A_scale = torch.empty((_cdiv(ROW, BLOCK_Q), _cdiv(COL, BLOCK_Q)), device=dev, dtype=torch.float32)
+        transposed = ROW > COL
+        # Allocate A and A_scale directly in (L,H)/(LQ,HQ) shape
+        A = torch.empty((L, H), device=dev, dtype=_prec2dtype(precision))
+        A_scale = torch.empty((LQ, HQ), device=dev, dtype=torch.float32)
 
         B = torch.empty((L, L), device=dev, dtype=_prec2dtype(precision))
         B_scale = torch.empty((LQ, LQ), device=dev, dtype=torch.float32)
@@ -807,17 +575,16 @@ class NSInt8:
         AAA = torch.as_strided(A, (L, L), (L, 1))
         AAA_scale = torch.as_strided(A_scale, (LQ, LQ), (LQ, 1))
 
-        Z = torch.empty((L, H), device=dev, dtype=torch.float32)
-
         A_frob_norm = torch.linalg.vector_norm(X).view(1)
-        self._to_bq(
-            M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
-        )(X, A_frob_norm, A, A_scale)
-
-        transposed = ROW > COL
         if transposed:
-            A = A.mT.contiguous()
-            A_scale = A_scale.mT.contiguous()
+            # Fused: to_bq + transpose out → writes (L, H) directly
+            self._to_bq_transpose_out(
+                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
+            )(X, A_frob_norm, A, A_scale)
+        else:
+            self._to_bq(
+                M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str, dtype_out=precision, use_norm=True, eps=eps
+            )(X, A_frob_norm, A, A_scale)
 
         # ── main loop ──
         N_iter = len(coeffs)
@@ -826,11 +593,19 @@ class NSInt8:
             self._aat_bq(M=L, K=H, dtype=precision)(A, A_scale, AA, AA_scale, AA_diag)
             self._quad_bq(M=L, dtype=precision)(AA, AA_scale, AA_diag, B, B_scale, B_diag, a, b, c)
             if i == N_iter - 1:
-                self._typeii_typei_final_bq(M=L, N=H, dtype=precision)(B, B_scale, B_diag, A, A_scale, Z)
-                Z = Z.to(X.dtype)
                 if transposed:
-                    Z = Z.mT.contiguous()
-                return Z
+                    # Fused: final GEMM + transpose out → writes (H, L) directly
+                    Z_T = torch.empty((H, L), device=dev, dtype=torch.float32)
+                    self._typeii_typei_final_bq_transpose_out(M=L, N=H, dtype=precision)(
+                        B, B_scale, B_diag, A, A_scale, Z_T
+                    )
+                    return Z_T.to(X.dtype)
+                else:
+                    Z = torch.empty((L, H), device=dev, dtype=torch.float32)
+                    self._typeii_typei_final_bq(M=L, N=H, dtype=precision)(
+                        B, B_scale, B_diag, A, A_scale, Z
+                    )
+                    return Z.to(X.dtype)
             else:
                 self._typeii_typei_bq(M=L, N=H, dtype=precision)(B, B_scale, B_diag, A, A_scale, C, C_scale)
                 A, A_scale, C, C_scale = C, C_scale, A, A_scale
@@ -872,11 +647,3 @@ class NSInt8:
                         return self._regular_i8, 'int8'
                     else:
                         return self._regular_prec, precision
-                    
-                        
-            
-
-
-
-
-
