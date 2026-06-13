@@ -194,13 +194,12 @@ class Muon(Optimizer):
 
         for group in self._muon_param_groups:
             for p in group["params"]:
-                if p.ndim != 2:
+                if p.ndim < 2:
                     raise ValueError(
-                        f"Muon only supports 2D parameters, got {p.size()}"
+                        f"Muon only supports >=2D parameters, got {p.size()}"
                     )
 
         self.scalar_optimizer = scalar_optimizer
-
 
 
     @property
