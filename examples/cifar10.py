@@ -4,9 +4,11 @@ import torch.nn as nn
 import torch.optim as optim
 import time
 import sys
-from torchvision import transforms
-from torchvision.datasets import CIFAR10
-from torch.utils.data import DataLoader
+import os
+
+from torch.utils.data import DataLoader, TensorDataset
+from datasets import load_dataset
+import numpy as np
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
@@ -27,15 +29,27 @@ print(f"Device: {device} | {torch.cuda.get_device_name(0) if torch.cuda.is_avail
 print(f"Batch size: {BSZ} | Hidden dim: {HIDDEN}")
 
 # ─── Data ───
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(MEAN, STD),
-])
+print("Loading CIFAR-10 from HuggingFace ...")
+dataset = load_dataset("uoft-cs/cifar10", split=["train", "test"])
+ds_train_raw, ds_test_raw = dataset[0], dataset[1]
 
-print("Loading CIFAR-10 ...")
+# Convert to tensors
+def to_tensors(examples):
+    images = np.array([np.array(img) for img in examples["img"]], dtype=np.float32) / np.float32(255.0)
+    MEAN32 = np.array(MEAN, dtype=np.float32).reshape(1, 1, 1, 3)
+    STD32 = np.array(STD, dtype=np.float32).reshape(1, 1, 1, 3)
+    images = (images - MEAN32) / STD32
+    images = images.transpose(0, 3, 1, 2)  # NHWC → NCHW
+    labels = np.array(examples["label"], dtype=np.int64)
+    return torch.from_numpy(images.copy()), torch.from_numpy(labels.copy())
 
-ds_train = CIFAR10(root="./data", train=True, download=True, transform=transform)
-ds_test  = CIFAR10(root="./data", train=False, download=True, transform=transform)
+print("Converting training set...")
+X_train, y_train = to_tensors(ds_train_raw[:])
+print("Converting test set...")
+X_test, y_test = to_tensors(ds_test_raw[:])
+
+ds_train = TensorDataset(X_train, y_train)
+ds_test  = TensorDataset(X_test, y_test)
 
 trainloader = DataLoader(ds_train, batch_size=BSZ, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
 testloader  = DataLoader(ds_test,  batch_size=BSZ, shuffle=False, num_workers=2, pin_memory=True)
@@ -84,7 +98,7 @@ def run(hidden):
         lr=0.001, 
         momentum=(0.95, 0.95), 
         weight_decay=0.01,
-        precision="fp8",
+        precision="auto",
         autotune=False,
         use_gram=False,
         use_cuda_graph=True
@@ -95,7 +109,7 @@ def run(hidden):
     print(f"\n{'Round':>5} {'Loss':>8} {'Train%':>7} {'Test%':>7} {'Time':>6}")
     print("-" * 40)
 
-    for rnd in range(1, N_ROUNDS + 1):
+    for rnd in range(1, 21):
         t0 = time.time()
         
         # --- Training Phase ---
