@@ -1,7 +1,8 @@
-
-import tilelang
 import tilelang.language as T
-import torch
+import os
+
+_EPS_ZERO = float(os.environ.get('I8MUON_EPS', '1e-8'))
+
 ####################### Norm & int8 #################################################
 
 def _sumsq_maxabs(
@@ -34,7 +35,7 @@ def _sumsq_maxabs(
                 Csquare_reducer[0] += T.cast(val2, T.float32)
             T.finalize_reducer(Cmax_reducer)
             T.finalize_reducer(Csquare_reducer)
-            if T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+            if T.get_thread_binding() == 0:
                 T.atomic_max(A_max[0], Cmax_reducer[0])
                 T.atomic_add(A_sumsq_or_norm[0], Csquare_reducer[0])
     return _sumsq_maxabs_
@@ -61,7 +62,7 @@ def _scale_int8(
         with T.Kernel(T.ceildiv(N, BLOCK_N), T.ceildiv(M, BLOCK_M), threads=threads) as (pid_n, pid_m):
             max_A = T.alloc_reducer((1,), dtype, op='max', replication="all")
             max_A[0] = A_max[0]
-            if pid_n == 0 and pid_m == 0 and T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+            if pid_n == 0 and pid_m == 0 and T.get_thread_binding() == 0:
                 A_scale[0] = A_max[0] / (127.0 * T.max(
                         T.cast(A_sumsq_or_norm[0], T.float32) 
                         if use_norm else 
@@ -136,7 +137,7 @@ def _aat_int8_max(
                 )
                 Cmax_reducer[0] = T.max(val, Cmax_reducer[0])
             T.finalize_reducer(Cmax_reducer)
-            if T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+            if T.get_thread_binding() == 0:
                 T.atomic_max(C_max[0], Cmax_reducer[0])
     return _aat_int8_max_
 
@@ -211,7 +212,7 @@ def _int32_compl_symm_int8(
 
                 T.copy(A8_frag, A8[pid_m * BLOCK_M, pid_n * BLOCK_N])
 
-                if pid_n == 0 and pid_m == 0 and T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+                if pid_n == 0 and pid_m == 0 and T.get_thread_binding() == 0:
                     A_scale[0] = AA_scale / scale_A
     return _int32_compl_symm_int8_
 
@@ -292,7 +293,7 @@ def _typeii_int8_sq(
                 Cmax_reducer[0] = T.max(val, Cmax_reducer[0])
             T.copy(C_float, C[pid_m * BLOCK_M, pid_n * BLOCK_N])
             T.finalize_reducer(Cmax_reducer)
-            if T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+            if T.get_thread_binding() == 0:
                 T.atomic_max(C_max[0], Cmax_reducer[0])
     return _typeii_int8_sq_
 
@@ -372,7 +373,7 @@ def _float32_compl_symm_int8_quad(
                         A_diag[row] = A32_frag[i,j] + (C2 * orig_diag[row] + C1) * orig_diag[row] + C0
                 T.copy(A8_frag, A8[pid_m * BLOCK_M, pid_n * BLOCK_N])
 
-                if pid_n == 0 and pid_m == 0 and T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+                if pid_n == 0 and pid_m == 0 and T.get_thread_binding() == 0:
                     A_scale[0] = 1.0 / scale_A
     return _float32_compl_symm_int8_quad_
 
@@ -454,7 +455,7 @@ def _typeii_int8_ab(
                 Cmax_reducer[0] = T.max(val, Cmax_reducer[0])
             T.copy(C_float, C[pid_m * BLOCK_M, pid_n * BLOCK_N])
             T.finalize_reducer(Cmax_reducer)
-            if T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+            if T.get_thread_binding() == 0:
                 T.atomic_max(C_max[0], Cmax_reducer[0])
     return _typeii_int8_ab_
 
@@ -529,7 +530,7 @@ def _float32_ab_to_int8(
                         A_diag[row] = A32_frag[i,j]
                 T.copy(A8_frag, A8[pid_m * BLOCK_M, pid_n * BLOCK_N])
 
-                if pid_n == 0 and pid_m == 0 and T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+                if pid_n == 0 and pid_m == 0 and T.get_thread_binding() == 0:
                     A_scale[0] = 1.0 / scale_A
     return _float32_ab_to_int8_
 
@@ -580,7 +581,7 @@ def _typeii_typei_int8(
                 Cmax_reducer[0] = T.max(val, Cmax_reducer[0])
             T.copy(C_float, C[pid_m * BLOCK_M, pid_n * BLOCK_N])
             T.finalize_reducer(Cmax_reducer)
-            if T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+            if T.get_thread_binding() == 0:
                 T.atomic_max(C_max[0], Cmax_reducer[0])
     return _typeii_typei_int8_
 
@@ -607,7 +608,7 @@ def _float32_to_int8(
             for (i, j) in T.Parallel(BLOCK_M, BLOCK_N):
                 C_frag[i,j] = T.cast(T.round(T.cast(C32_frag[i,j], T.float32) * scale_C), T.int8)
             T.copy(C_frag, C[pid_m * BLOCK_M, pid_n * BLOCK_N]) 
-            if pid_n == 0 and pid_m == 0 and T.get_lane_idx() == 0 and T.get_warp_idx() == 0:
+            if pid_n == 0 and pid_m == 0 and T.get_thread_binding() == 0:
                 C_scale[0] = 1.0 / scale_C
     return _float32_to_int8_
 
@@ -859,7 +860,7 @@ def _to_bq(
         with T.Kernel(nd, md, threads=threads) as (pid_n, pid_m):
             A_scale_1 = T.alloc_var(T.float32)
             A_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
-            T.fill(A_scale_2, 0)
+            T.fill(A_scale_2, _EPS_ZERO)
             A_scale_1 = 1.0 / T.max(
                 T.cast(A_sumsq_or_norm[0], T.float32) if use_norm else T.sqrt(T.cast(A_sumsq_or_norm[0], T.float32)), 
                 eps
@@ -871,7 +872,7 @@ def _to_bq(
                 A_scale_2[0] = T.max(A_scale_2[0], T.abs(A_local[i, j]))
             T.finalize_reducer(A_scale_2)
             A_scale_1 = DTYPE_MAX / A_scale_2[0]
-            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+            if T.get_thread_binding() == 0:
                 A_scale[pid_m, pid_n] = 1 / A_scale_1
             for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
                 A_local[i, j] = A_local[i, j] * A_scale_1
@@ -931,7 +932,7 @@ def _aat_bq(
                     C_float[i, j] = T.cast(C_local[i, j], T.float32) * A_scale_1 + C_float[i, j]        
             
             C_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
-            T.fill(C_scale_2, 0)
+            T.fill(C_scale_2, _EPS_ZERO)
             if pid_m == pid_n:
                 for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
                     if i == j:
@@ -945,7 +946,7 @@ def _aat_bq(
             T.finalize_reducer(C_scale_2)
             
             A_scale_1 = DTYPE_MAX / C_scale_2[0]
-            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+            if T.get_thread_binding() == 0:
                 C_scale[pid_m, pid_n] = 1 / A_scale_1
                 C_scale[pid_n, pid_m] = 1 / A_scale_1
 
@@ -1024,7 +1025,7 @@ def _quad_bq(
             is_diag = pid_m == pid_n
 
             C_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
-            T.fill(C_scale_2, 0)
+            T.fill(C_scale_2, _EPS_ZERO)
             ai = T.alloc_var(T.float32)
             for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
                 ai = A_diag_shared[i]
@@ -1039,7 +1040,7 @@ def _quad_bq(
             T.finalize_reducer(C_scale_2)
 
             A_scale_1 = DTYPE_MAX / C_scale_2[0]
-            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+            if T.get_thread_binding() == 0:
                 C_scale[pid_m, pid_n] = 1 / A_scale_1
                 C_scale[pid_n, pid_m] = 1 / A_scale_1
 
@@ -1103,7 +1104,7 @@ def _typeii_typei_bq(
             B_var = B_scale[pid_m, pid_n]
             # A_var_beta = A_var * BETA
             Cmax_reducer = T.alloc_reducer((1,), T.float32, op='max', replication="all")
-            T.fill(Cmax_reducer, 0)
+            T.fill(Cmax_reducer, _EPS_ZERO)
             for (i, j) in T.Parallel(BLOCK_Q, BLOCK_Q):
                 C_float[i, j] += (T.cast(B8[i,j], T.float32) * row_shared[i]) * B_var
                 val = T.abs(C_float[i, j])
@@ -1111,7 +1112,7 @@ def _typeii_typei_bq(
             T.finalize_reducer(Cmax_reducer)
 
             A_scale_1 = DTYPE_MAX / Cmax_reducer[0]
-            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+            if T.get_thread_binding() == 0:
                 C_scale[pid_m, pid_n] = 1 / A_scale_1
             for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
                 C_float[i, j] = C_float[i, j] * A_scale_1
@@ -1236,7 +1237,7 @@ def _ab_symm_bq(
             is_diag = pid_m == pid_n
 
             C_scale_2 = T.alloc_reducer((1,), T.float32, op="max", replication="all")
-            T.fill(C_scale_2, 0)
+            T.fill(C_scale_2, _EPS_ZERO)
             for i, j in T.Parallel(BLOCK_Q, BLOCK_Q):
                 C_float[i, j] += (
                     B_diag_shared[j] * A_scale_1 * A_shared_2[i, j] 
@@ -1250,7 +1251,7 @@ def _ab_symm_bq(
             T.finalize_reducer(C_scale_2)
 
             A_scale_1 = DTYPE_MAX / C_scale_2[0]
-            if (T.get_lane_idx() == 0 and T.get_warp_idx() == 0):
+            if T.get_thread_binding() == 0:
                 C_scale[pid_m, pid_n] = 1 / A_scale_1
                 C_scale[pid_n, pid_m] = 1 / A_scale_1
 
