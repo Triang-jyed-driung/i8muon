@@ -4,6 +4,27 @@ Muon optimizer has recently attracted considerable attention. However, until now
 
 A GPU-accelerated implementation of the **Muon optimizer** (Keller Jordan, 2024) that replaces the standard Newton-Schulz orthogonalization step with **int8 precision** written in **TileLang**, delivering faster per-step throughput while maintaining accuracy parity with the float reference.
 
+## Known issues
+
+These issues affected TileLang v0.1.8–0.1.11. **Install the latest TileLang from GitHub** (`pip install git+https://github.com/tile-ai/tilelang.git`).
+
+If you must use an older TileLang version:
+
+| Version | Issues |
+|---------|--------|
+| 0.1.11 (RTX 5090 specific) | Incorrect int8 results. Block quantization kernels hang. TMA broken. Set `export I8MUON_USE_TMA=0`. |
+| 0.1.10 (RTX 5090 specific) | block quantization kernels hang in some configurations. Disable autotune for those kernels. |
+| 0.1.9 | Autotuning hangs in fp16/bf16 kernels (RTX 5090); off-by-one cp.async (RTX 4090) and wrong results. |
+| ≤0.1.8 | Missing features (tile transpose). |
+
+#### If you encounter a kernel hang
+If a kernel has been running for more than two seconds, it is likely hung. To terminate the process, follow these steps:
+
+1. Open `htop`. 
+2. Select the hung process, and press F9 or click "Kill".
+3. Select `SIGTERM`, and press Enter or click "Send".
+4. (Optional) After that, launch a fresh zeroing kernel, like `torch.zeros(4096, device="cuda")` to drop down power usage.
+
 ## Training run
 <img width="1641" height="871" alt="image" src="https://github.com/user-attachments/assets/fda52263-d210-4b1f-b2b7-48aeea7e92d4" />
 A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8, fp8 and fp16 Muon. All stable and no spikes.
@@ -255,15 +276,15 @@ The `_gram_*` methods additionally scale all coefficients by 0.997 per iteration
 Requirements:
 - Python >= 3.10 (tested and verified on 3.12, 3.13 and 3.14)
 - PyTorch >= 2.8 with CUDA
-- TileLang >= 0.1.10
+- TileLang (latest from GitHub)
 - NVIDIA GPU with Compute Capability >= 7.5 (Turing or newer, for int8 Tensor Cores)
 
 ```
 pip install torch
-pip install tilelang
+pip install git+https://github.com/tile-ai/tilelang.git
 ```
 
-**Critical note on TileLang version.** During development, four distinct TileLang bugs (https://github.com/tile-ai/tilelang/issues/2053, https://github.com/tile-ai/tilelang/issues/2081, https://github.com/tile-ai/tilelang/issues/2172, https://github.com/tile-ai/tilelang/issues/2200) were encountered. Some could produce silently incorrect numerical results in int8 matrix kernels. Most were fixed in TileLang >= 0.1.10, though certain shapes for int8 (e.g., 128x257) remain to be solved. Using an older version will cause missing features as well as computation errors. Installing the latest version from PyPI or directly from the GitHub repository is strongly recommended.
+**TileLang version note.** During development, more than 6 distinct TileLang bugs (including [#2053](https://github.com/tile-ai/tilelang/issues/2053), [#2081](https://github.com/tile-ai/tilelang/issues/2081), [#2172](https://github.com/tile-ai/tilelang/issues/2172), [#2200](https://github.com/tile-ai/tilelang/issues/2200)) were encountered. These have  been resolved in the latest TileLang. Install from GitHub to get the fixes.
 
 ## Usage
 
