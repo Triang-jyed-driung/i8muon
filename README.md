@@ -6,36 +6,16 @@ A GPU-accelerated implementation of the **Muon optimizer** (Keller Jordan, 2024)
 
 ## Known issues
 
-This is an experimental branch. Read this section before running any kernels.
+These issues affected TileLang v0.1.8–0.1.11. **Install the latest TileLang from GitHub** (`pip install git+https://github.com/tile-ai/tilelang.git`).
 
-TileLang's TMA and warp specialization features are experimental.
+If you must use an older TileLang version:
 
-If you're using TileLang v0.1.11, it is strongly recommended to disable this option:
-```bash
-    export I8MUON_USE_TMA=0
-```
-
-Known issues by version:
-
-1. TileLang 0.1.11 on RTX 5090:
-    - Incorrect results across nearly all int8 and block quantization kernels.
-    - Kernel hangs (sync errors) under almost all block quantization configurations.
-    - The consumer thread layout changes between versions, and TileLang does not expose any API for querying relative thread IDs within a consumer group.
-    - Do not use TMA or warp specialization on this version. `export I8MUON_USE_TMA=0`
-    - Disabling TMA and WS has a 10-15% performance penalty, but should run correctly.
-
-2. TileLang 0.1.10 on RTX 5090 (currently the most stable version):
-    - Kernel hangs (sync errors) in some block quantization configurations. Setting autotune=False avoids most issues, but the default parameters may still fail on certain shapes.
-    - Do not enable autotuning with block quantization kernels.
-
-3. TileLang 0.1.9:
-    - Kernel hangs (sync errors) in some fp16/bf16 (*_prec) kernels on RTX 5090.
-    - Incorrect int8 matrix multiplication results on RTX 4090 for certain shapes, caused by an off-by-one error in cp.async stage calculation.
-    - Upgrade to TileLang 0.1.10.
-
-4. TileLang 0.1.8 and lower:
-    - Some features like tile transpose are missing.
-    - Upgrade to TileLang 0.1.10.
+| Version | Issues |
+|---------|--------|
+| 0.1.11 (RTX 5090 specific) | Incorrect int8 results. Block quantization kernels hang. TMA broken. Set `export I8MUON_USE_TMA=0`. |
+| 0.1.10 (RTX 5090 specific) | block quantization kernels hang in some configurations. Disable autotune for those kernels. |
+| 0.1.9 | Autotuning hangs in fp16/bf16 kernels (RTX 5090); off-by-one cp.async (RTX 4090) and wrong results. |
+| ≤0.1.8 | Missing features (tile transpose). |
 
 #### If you encounter a kernel hang
 If a kernel has been running for more than two seconds, it is likely hung. To terminate the process, follow these steps:
@@ -46,8 +26,48 @@ If a kernel has been running for more than two seconds, it is likely hung. To te
 4. (Optional) After that, launch a fresh zeroing kernel, like `torch.zeros(4096, device="cuda")` to drop down power usage.
 
 ## Training run
-<img width="1827" height="887" alt="image" src="https://github.com/user-attachments/assets/7dea6ebc-59f3-4f43-9089-7a4e774c123a" />
-A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8 Muon. Stable and no spikes.
+<img width="1641" height="871" alt="image" src="https://github.com/user-attachments/assets/fda52263-d210-4b1f-b2b7-48aeea7e92d4" />
+A model with Qwen3 architecture, 8 layers, dimension 1024 trained under the int8, fp8 and fp16 Muon. All stable and no spikes.
+
+## i8muon int8 vs [Gram-Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz) — RTX 5090
+
+Both methods use Newton-Schulz iterations to orthogonalize matrices.
+- **i8muon** applies TileLang autotuned int8 kernels with CUDA graphs.
+- **GNS** uses CuTeDSL symmetric GEMM kernels with `torch.compile` (reduce-overhead) and CUDA graphs.
+- **GNS best** = `min(GNS gram, GNS standard)` per shape.
+- **Speedup** = GNS best / i8muon int8 (>1 means i8muon is faster).
+- All timings are CUDA-event min over 10 measurements after 3 warmup iterations.
+
+**Summary:** i8muon int8 wins 16 of 22 shapes. Total time: 16.10 ms vs 22.02 ms — a **1.37×** overall speedup. GNS holds a slight edge on tall-skinny shapes where M ≫ N (e.g., 2048×512, 3072×1024).
+
+| Shape | i8muon int8 (ms) | GNS best (ms) | GNS standard (ms) | Speedup |
+|-------|-----------------:|--------------:|------------------:|-------------:|
+| 512×512 | 0.1082 | **0.1055** | **0.1055** | 0.98x |
+| 768×768 | **0.1287** | 0.1356 | 0.1364 | 1.05x |
+| 512×1536 | **0.1257** | 0.1301 | 0.1367 | 1.04x |
+| 1536×512 | 0.1430 | **0.1305** | 0.1359 | 0.91x |
+| 512×2048 | **0.1353** | 0.1395 | 0.1543 | 1.03x |
+| 2048×512 | 0.1560 | **0.1377** | 0.1541 | 0.88x |
+| 1024×1024 | **0.1498** | 0.1750 | 0.1750 | 1.17x |
+| 768×2048 | **0.1733** | 0.1870 | 0.2258 | 1.08x |
+| 2048×768 | 0.2036 | **0.1868** | 0.2258 | 0.92x |
+| 1536×1536 | **0.2561** | 0.4347 | 0.4347 | 1.70x |
+| 1024×3072 | **0.2498** | 0.2628 | 0.3410 | 1.05x |
+| 3072×1024 | 0.3101 | **0.2620** | 0.3408 | 0.84x |
+| 2048×2048 | **0.4405** | 1.0492 | 1.0520 | 2.38x |
+| 1536×4096 | **0.5096** | 0.6492 | 0.8704 | 1.27x |
+| 4096×1536 | **0.6267** | 0.6553 | 0.8762 | 1.05x |
+| 2560×2560 | **0.8700** | 1.6445 | 1.6486 | 1.89x |
+| 2048×8192 | **1.1940** | 1.8760 | 2.9338 | 1.57x |
+| 8192×2048 | **1.4848** | 1.8780 | 2.9348 | 1.26x |
+| 2560×7168 | **1.6568** | 2.6460 | 3.8379 | 1.60x |
+| 7168×2560 | **2.0070** | 2.6481 | 3.8308 | 1.32x |
+| 2560×10240 | **2.3326** | 3.3444 | 5.2521 | 1.43x |
+| 10240×2560 | **2.8416** | 3.3444 | 5.2449 | 1.18x |
+
+**Key observations:**
+- Near-tie on tiny matrices (512², 768²); both around 0.1 ms.
+- i8muon pulls ahead at ≥1024² and dominates on large square shapes (2048²: 2.38×, 2560²: 1.89×).
 
 ## Background
 
@@ -256,15 +276,15 @@ The `_gram_*` methods additionally scale all coefficients by 0.997 per iteration
 Requirements:
 - Python >= 3.10 (tested and verified on 3.12, 3.13 and 3.14)
 - PyTorch >= 2.8 with CUDA
-- TileLang >= 0.1.10
+- TileLang (latest from GitHub)
 - NVIDIA GPU with Compute Capability >= 7.5 (Turing or newer, for int8 Tensor Cores)
 
 ```
 pip install torch
-pip install tilelang
+pip install git+https://github.com/tile-ai/tilelang.git
 ```
 
-**Critical note on TileLang version.** During development, four distinct TileLang bugs (https://github.com/tile-ai/tilelang/issues/2053, https://github.com/tile-ai/tilelang/issues/2081, https://github.com/tile-ai/tilelang/issues/2172, https://github.com/tile-ai/tilelang/issues/2200) were encountered. Some could produce silently incorrect numerical results in int8 matrix kernels. Most were fixed in TileLang >= 0.1.10, though certain shapes for int8 (e.g., 128x257) remain to be solved. Using an older version will cause missing features as well as computation errors. Installing the latest version from PyPI or directly from the GitHub repository is strongly recommended.
+**TileLang version note.** During development, more than 6 distinct TileLang bugs (including [#2053](https://github.com/tile-ai/tilelang/issues/2053), [#2081](https://github.com/tile-ai/tilelang/issues/2081), [#2172](https://github.com/tile-ai/tilelang/issues/2172), [#2200](https://github.com/tile-ai/tilelang/issues/2200)) were encountered. These have  been resolved in the latest TileLang. Install from GitHub to get the fixes.
 
 ## Usage
 

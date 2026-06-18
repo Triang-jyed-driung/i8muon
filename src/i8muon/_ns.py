@@ -13,38 +13,7 @@ GRAM_ORDER = os.environ.get("I8MUON_GRAM_RESET", '00100')
 # warnings.warn(f"I8MUON: disable TMA and warp specialization: {DISABLE_TMA}")
 if not DISABLE_TMA:
     warnings.warn(
-"""
-TileLang's TMA and warp specialization features are experimental.
-
-If you're using TileLang v0.1.11, it is strongly recommended to disable this option:
-    export I8MUON_USE_TMA=0
-
-Known issues by version:
-
-  TileLang 0.1.11 on RTX 5090:
-    - Incorrect results across nearly all int8 and block quantization kernels.
-    - Kernel hangs (sync errors) under almost all block quantization configurations.
-    - The consumer thread layout changes between versions, and TileLang does not
-      expose any API for querying relative thread IDs within a consumer group.
-    - Do not use TMA or warp specialization on this version. export I8MUON_USE_TMA=0
-    - Disabling TMA and WS has a 10-15% performance penalty, but should run correctly.
-
-  TileLang 0.1.10 on RTX 5090 (currently the most stable version):
-    - Kernel hangs (sync errors) in some block quantization configurations.
-      Setting autotune=False avoids most issues, but the default parameters may
-      still fail on certain shapes.
-    - Do not enable autotuning with block quantization kernels.
-
-  TileLang 0.1.9:
-    - Kernel hangs (sync errors) in some fp16/bf16 (*_prec) kernels on RTX 5090.
-    - Incorrect int8 matrix multiplication results on RTX 4090 for certain shapes,
-      caused by an off-by-one error in cp.async stage calculation.
-    - Upgrade to TileLang 0.1.10.
-
-  TileLang 0.1.8 and lower:
-    - Some features like tile transpose are missing.
-    - Upgrade to TileLang 0.1.10.
-"""
+"""TileLang TMA/warp specialization is experimental. Install latest TileLang from GitHub. See README 'Known issues' for details."""
     )
 
 _CONF = {
