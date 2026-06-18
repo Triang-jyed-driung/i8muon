@@ -1,6 +1,7 @@
 
 import math
 from collections.abc import MutableMapping
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -24,7 +25,7 @@ def _adjust_lr(lr: float, adjust_lr_fn, param_shape: torch.Size) -> float:
     If ``adjust_lr_fn`` is callable: ``fn(lr, A, B) -> float``.
     Built-in strings: ``"spectral"`` (default), ``"original"``, ``"match_rms_adamw"``.
     """
-    A, B = param_shape[:2]
+    A, B = param_shape[-2], param_shape[-1]
 
     if callable(adjust_lr_fn):
         return adjust_lr_fn(lr, A, B) # type: ignore
@@ -116,6 +117,7 @@ class Muon(Optimizer):
         use_cuda_graph: bool = False,
         gram_aspect_threshold: float = _GRAM_ASPECT_THRESHOLD,
         deterministic: bool = True,
+        scalar_optimizer: Optional[Optimizer] = None,
     ) -> None:
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
@@ -174,6 +176,7 @@ class Muon(Optimizer):
         
         self._ns_graphs: dict[tuple, object] = {}  # key → (graph, output_tensor)
         self._gram_aspect_threshold = gram_aspect_threshold
+        self.scalar_optimizer = None  # placeholder; real value set after 2D check
 
         defaults = {
             "lr": lr,
@@ -187,15 +190,47 @@ class Muon(Optimizer):
             "precision": precision,
         }
         super().__init__(params, defaults)
+        self._muon_param_groups = self.param_groups
 
-        for group in self.param_groups:
+        for group in self._muon_param_groups:
             for p in group["params"]:
-                if p.ndim != 2:
+                if p.ndim < 2:
                     raise ValueError(
-                        f"Muon only supports 2D parameters, got {p.size()}"
+                        f"Muon only supports >=2D parameters, got {p.size()}"
                     )
 
+        self.scalar_optimizer = scalar_optimizer
 
+
+    @property
+    def param_groups(self):
+        """Expose both muon and scalar optimizer param groups for LR schedulers."""
+        if self.scalar_optimizer is None:
+            return self._muon_param_groups
+        return self._muon_param_groups + self.scalar_optimizer.param_groups
+
+    @param_groups.setter
+    def param_groups(self, value):
+        """Set param_groups during initialization. Called by PyTorch's Optimizer.__init__."""
+        self._muon_param_groups = value
+
+    def state_dict(self):
+        """Return state_dict for muon params only (scalar state is separate)."""
+        scalar = self.scalar_optimizer
+        self.scalar_optimizer = None
+        try:
+            return super().state_dict()
+        finally:
+            self.scalar_optimizer = scalar
+
+    def load_state_dict(self, state_dict):
+        """Load state_dict for muon params only."""
+        scalar = self.scalar_optimizer
+        self.scalar_optimizer = None
+        try:
+            super().load_state_dict(state_dict)
+        finally:
+            self.scalar_optimizer = scalar
 
     # ── helper ────────────────────────────────────────────────────
 
@@ -228,6 +263,12 @@ class Muon(Optimizer):
 
     # ── step ──────────────────────────────────────────────────────
 
+    def zero_grad(self, set_to_none: bool = True):
+        """Zero gradients for both Muon parameters and scalar optimizer parameters."""
+        super().zero_grad(set_to_none=set_to_none)
+        if self.scalar_optimizer is not None:
+            self.scalar_optimizer.zero_grad(set_to_none=set_to_none)
+
     @torch.no_grad()
     def step(self, closure=None):
         """Performs a single optimization step.
@@ -237,13 +278,15 @@ class Muon(Optimizer):
         2. Compute Nesterov-adjusted update
         3. Apply Newton-Schulz orthogonalization (int8 or float fallback)
         4. Apply weight decay + scaled update
+
+        If scalar_optimizer is provided, also calls scalar_optimizer.step().
         """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.param_groups:
+        for group in self._muon_param_groups:
             lr = group["lr"]
             weight_decay = group["weight_decay"]
             momentum = group["momentum"]
@@ -281,6 +324,10 @@ class Muon(Optimizer):
                 ns_graphs=self._ns_graphs,
                 gram_aspect_threshold=self._gram_aspect_threshold,
             )
+
+        if self.scalar_optimizer is not None:
+            self.scalar_optimizer.step()
+
         return loss
 
 
@@ -319,14 +366,14 @@ def _single_tensor_muon(
 
     for i, param in enumerate(params):
         grad = grads[i]
-        if grad.ndim != 2:
+        if grad.ndim < 2:
             raise ValueError("Param gradient must be a 2D matrix")
 
         buf = momentum_bufs[i]
         buf.lerp_(grad, 1 - mu2)
         update = grad.lerp(buf, mu) if nesterov else buf
 
-        M, N = update.shape
+        M, N = update.shape[-2], update.shape[-1]
         
         ns_fn, actual_prec = ns_engine.router(M, N, precision, use_gram, gram_aspect_threshold)
         def call_ns(u):
