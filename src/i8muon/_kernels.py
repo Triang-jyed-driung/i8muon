@@ -591,8 +591,8 @@ def _to_prec(
 
 def _ab_prec(M: int, N: int, K: int,
            B: int = 1,
-           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 128,
-           threads: int = 256, num_stages: int = 3,
+           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 64,
+           threads: int = 128, num_stages: int = 2,
            dtype: str = 'float16', accum_dtype: str = 'float32'):
     @T.prim_func
     def _ab_prec_(A: T.Tensor((B, M, K), dtype),
@@ -612,8 +612,8 @@ def _ab_prec(M: int, N: int, K: int,
 
 def _aat_prec(M: int = 4096, K: int = 6144,
            B: int = 1,
-           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 128,
-           threads: int = 256, num_stages: int = 3,
+           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 64,
+           threads: int = 128, num_stages: int = 2,
            dtype: str = 'float16', accum_dtype: str = 'float32'):
 
     R = BLOCK_M // BLOCK_N
@@ -643,6 +643,9 @@ def _aat_prec(M: int = 4096, K: int = 6144,
                 T.copy(A[pid_b, pid_n * BLOCK_N, k * BLOCK_K], B_shared) 
                 T.gemm(A_shared, B_shared, C_local, transpose_B=True)
             T.copy(C_local, C[pid_b, pid_m * BLOCK_M, pid_n * BLOCK_N])
+
+            del A_shared
+            del B_shared
 
             s_shared = T.alloc_shared((BLOCK_M, BLOCK_N), dtype)
             t_shared = T.alloc_shared((BLOCK_N, BLOCK_M), dtype)
@@ -1281,11 +1284,11 @@ def _typeii_typei_int8_transpose_out(
                 ) * B_var
                 val = T.abs(C_float[i, j])
                 Cmax_reducer[0] = T.max(val, Cmax_reducer[0])
-            for j, i in T.Parallel(BLOCK_N, BLOCK_M):
-                C[pid_b, pid_n * BLOCK_N + j, pid_m * BLOCK_M + i] = C_float[i, j]
             T.finalize_reducer(Cmax_reducer)
             if T.get_thread_binding() == 0:
                 T.atomic_max(C_max[pid_b], Cmax_reducer[0])
+            for j, i in T.Parallel(BLOCK_N, BLOCK_M):
+                C[pid_b, pid_n * BLOCK_N + j, pid_m * BLOCK_M + i] = C_float[i, j]
     return _typeii_typei_int8_transpose_out_
 
 
@@ -1326,27 +1329,25 @@ def _to_prec_transpose_out(
 
 def _ab_prec_transpose_out(M: int, N: int, K: int,
            B: int = 1,
-           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 128,
-           threads: int = 256, num_stages: int = 3,
+           BLOCK_M: int = 64, BLOCK_N: int = 64, BLOCK_K: int = 64,
+           threads: int = 128, num_stages: int = 2,
            dtype: str = 'float16', accum_dtype: str = 'float32'):
     @T.prim_func
-    def _ab_prec_transpose_out_(A: T.Tensor((B, M, K), dtype),
-               B_mat: T.Tensor((B, K, N), dtype),
-               C: T.Tensor((B, N, M), dtype)):
+    def _ab_prec_transpose_out_(
+        A: T.Tensor((B, M, K), dtype),
+        B_mat: T.Tensor((B, K, N), dtype),
+        C: T.Tensor((B, N, M), dtype)
+    ):
         with T.Kernel(B, T.ceildiv(N, BLOCK_N), T.ceildiv(M, BLOCK_M), threads=threads) as (pid_b, pid_n, pid_m):
             A_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
             B_shared = T.alloc_shared((BLOCK_K, BLOCK_N), dtype)
-            C_local = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            C_local = T.alloc_fragment((BLOCK_N, BLOCK_M), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=num_stages):
                 T.copy(A[pid_b, pid_m * BLOCK_M, k * BLOCK_K], A_shared)
                 T.copy(B_mat[pid_b, k * BLOCK_K, pid_n * BLOCK_N], B_shared)
-                T.gemm(A_shared, B_shared, C_local)
-            C_shared = T.alloc_shared((BLOCK_M, BLOCK_N), dtype)
-            C_shared_T = T.alloc_shared((BLOCK_N, BLOCK_M), dtype)
-            T.copy(C_local, C_shared)
-            T.transpose(C_shared, C_shared_T)
-            T.copy(C_shared_T, C[pid_b, pid_n * BLOCK_N, pid_m * BLOCK_M])
+                T.gemm(B_shared, A_shared, C_local, transpose_A=True, transpose_B=True)
+            T.copy(C_local, C[pid_b, pid_n * BLOCK_N, pid_m * BLOCK_M])
     return _ab_prec_transpose_out_
 
 
@@ -1445,7 +1446,6 @@ def _ab_symm_bq(
             else:
                 T.copy(C_float, C[pid_b, pid_m * BLOCK_Q, pid_n * BLOCK_Q])
     return _ab_symm_bq_
-
 
 
 __all__ = [

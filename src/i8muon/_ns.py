@@ -221,7 +221,7 @@ kernel_map = [
 def _prec2dtype(prec: str):
     return getattr(torch, prec)
 
-def _to_batched(X: torch.Tensor):
+def _to_3D(X: torch.Tensor):
     """Reshape X to 3D (B,ROW,COL).  Returns (X, orig_shape)."""
     assert X.ndim >= 2
     X = X.contiguous()
@@ -233,7 +233,7 @@ def _to_batched(X: torch.Tensor):
     return X, orig_shape
 
 
-def _from_batched(result: torch.Tensor, orig_shape: torch.Size):
+def _resume_shape(result: torch.Tensor, orig_shape: torch.Size):
     """Reshape result back to orig_shape if needed."""
     if result.shape != orig_shape:
         return result.view(orig_shape)
@@ -292,7 +292,7 @@ class NSInt8:
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        X, orig_shape = _to_batched(X)
+        X, orig_shape = _to_3D(X)
         B, ROW, COL = X.shape
         L = min(ROW, COL)
         H = max(ROW, COL)
@@ -345,10 +345,10 @@ class NSInt8:
         if transposed:
             Y_T = torch.empty((B, H, L), device=dev, dtype=prec)
             self._ab_prec_transpose_out(**Knsq)(Q0, A, Y_T)
-            return _from_batched(Y_T, orig_shape).to(X.dtype)
+            return _resume_shape(Y_T, orig_shape).to(X.dtype)
         else:
             self._ab_prec(**Knsq)(Q0, A, Y)
-            return _from_batched(Y, orig_shape).to(X.dtype)
+            return _resume_shape(Y, orig_shape).to(X.dtype)
 
     def _gram_bq(
         self,
@@ -379,7 +379,7 @@ class NSInt8:
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        X, orig_shape = _to_batched(X)
+        X, orig_shape = _to_3D(X)
         B, ROW, COL = X.shape
         dev = X.device
         dtype_str = str(X.dtype).split(".")[-1]
@@ -444,12 +444,11 @@ class NSInt8:
                     result = C32_T.to(X.dtype)
                 else:
                     result = C32.to(X.dtype)
-                return _from_batched(result, orig_shape)
+                return _resume_shape(result, orig_shape)
             else:
                 self._float32_to_int8(B=B, M=L, N=H)(C32, C_max, A8, A_scale)
                 atom.zero_()
 
-        raise RuntimeError("unreachable")
         raise RuntimeError("unreachable")
     
     def _regular_prec(
@@ -464,7 +463,7 @@ class NSInt8:
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        X, orig_shape = _to_batched(X)
+        X, orig_shape = _to_3D(X)
         B, ROW, COL = X.shape
         dev = X.device
         dtype_str = str(X.dtype).split(".")[-1]
@@ -493,13 +492,13 @@ class NSInt8:
             self._quad_prec(B=B, M=L, dtype=precision)(AA, B_mat, a, b, c)
             if i == N_iter - 1:
                 if transposed:
-                    C_T = torch.empty((B, H, L), device=dev, dtype=_prec2dtype(precision))
+                    C_T = torch.as_strided(C, (B, H, L), (H*L, L, 1))
                     self._ab_prec_transpose_out(B=B, M=L, K=L, N=H, dtype=precision)(B_mat, A, C_T)
                     result = C_T.to(X.dtype)
                 else:
                     self._ab_prec(B=B, M=L, K=L, N=H, dtype=precision)(B_mat, A, C)
                     result = C.to(X.dtype)
-                return _from_batched(result, orig_shape)
+                return _resume_shape(result, orig_shape)
             else:
                 self._ab_prec(B=B, M=L, K=L, N=H, dtype=precision)(B_mat, A, C)
                 A, C = C, A
@@ -518,7 +517,7 @@ class NSInt8:
         if coeffs is None:
             coeffs = _DEFAULT_NS_COEFFS
 
-        X, orig_shape = _to_batched(X)
+        X, orig_shape = _to_3D(X)
         B, ROW, COL = X.shape
         dev = X.device
         dtype_str = str(X.dtype).split(".")[-1]
@@ -545,6 +544,8 @@ class NSInt8:
         AAA = torch.as_strided(A, (B, L, L), (L * L, L, 1))
         AAA_scale = torch.as_strided(A_scale, (B, LQ, LQ), (LQ * LQ, LQ, 1))
 
+        Z = torch.empty((B, L, H), device=dev, dtype=torch.float32)
+
         A_frob_norm = X.norm(dim=[1, 2], keepdim=True).view(B)
         if transposed:
             self._to_bq_transpose_out(B=B, M=ROW, N=COL, dtype=dtype_str, dtype2=dtype_str,
@@ -560,16 +561,15 @@ class NSInt8:
             self._quad_bq(B=B, M=L, dtype=precision)(AA, AA_scale, AA_diag, B_mat, B_scale, B_diag, a, b, c)
             if i == N_iter - 1:
                 if transposed:
-                    Z_T = torch.empty((B, H, L), device=dev, dtype=torch.float32)
+                    Z_T = torch.as_strided(Z, (B, H, L), (H*L, L, 1))
                     self._typeii_typei_final_bq_transpose_out(B=B, M=L, N=H, dtype=precision)(
                         B_mat, B_scale, B_diag, A, A_scale, Z_T)
                     result = Z_T.to(X.dtype)
                 else:
-                    Z = torch.empty((B, L, H), device=dev, dtype=torch.float32)
                     self._typeii_typei_final_bq(B=B, M=L, N=H, dtype=precision)(
                         B_mat, B_scale, B_diag, A, A_scale, Z)
                     result = Z.to(X.dtype)
-                return _from_batched(result, orig_shape)
+                return _resume_shape(result, orig_shape)
             else:
                 self._typeii_typei_bq(B=B, M=L, N=H, dtype=precision)(B_mat, B_scale, B_diag, A, A_scale, C, C_scale)
                 A, A_scale, C, C_scale = C, C_scale, A, A_scale
