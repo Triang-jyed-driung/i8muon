@@ -4,26 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "i8muon"
-version = "0.1.0"
-description = "Int8-accelerated Muon optimizer with TileLang CUDA kernels"
+version = "0.2.0"
+description = "Muon with INT8 safety/Polar Express coefficients and CUTLASS CUDA kernels for SM87/89/120"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.8",
-    "tilelang>=0.1.10",
+    "torch>=2.2",
+    "ninja",
 ]
 
 [project.optional-dependencies]
-test = [
-    "numpy",
-    "torchvision",
-    "datasets",
-    "matplotlib",
-]
-
-[project.urls]
-Homepage = "https://github.com/user/i8muon"
+examples = ["torchvision"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = false
+
+[tool.setuptools.package-data]
+i8muon = ["csrc/*.cu", "_vendor/cutlass/include/**/*", "_vendor/cutlass/*.txt"]
+
+[tool.setuptools.data-files]
+"share/i8muon/examples" = ["examples/*.py"]

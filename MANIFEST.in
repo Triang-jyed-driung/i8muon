@@ -1,0 +1,6 @@
+include README.md
+recursive-include docs *.md
+recursive-include examples *.py
+recursive-include coefficients *.json
+recursive-include src/i8muon/csrc *.cu
+recursive-include src/i8muon/_vendor/cutlass *
